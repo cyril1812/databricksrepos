@@ -1,0 +1,7 @@
+# UC Readiness Accelerator - Databricks App
+command: ["streamlit", "run", "app.py"]
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: 6fcaa843626846e7
+    description: SQL Warehouse ID for querying assessment data

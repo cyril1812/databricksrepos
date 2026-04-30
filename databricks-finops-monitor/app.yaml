@@ -1,0 +1,6 @@
+command: ['streamlit', 'run', 'app.py', '--server.maxUploadSize=50']
+env:
+  - name: 'STREAMLIT_GATHER_USAGE_STATS'
+    value: 'false'
+  - name: 'STREAMLIT_THEME_BASE'
+    value: 'dark'

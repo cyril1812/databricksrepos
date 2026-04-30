@@ -1,0 +1,7 @@
+databricks-sdk
+databricks-sql-connector
+streamlit
+pandas
+numpy
+plotly
+scikit-learn
