@@ -1,0 +1,61 @@
+{
+  "custom_summary": "DBU Cost Spike Detected - Consumption >50% Above Baseline",
+  "evaluation": {
+    "source": {
+      "name": "Spike Pct"
+    },
+    "comparison_operator": "GREATER_THAN",
+    "threshold": {
+      "value": {
+        "double_value": 50.0
+      }
+    },
+    "notification": {
+      "retrigger_seconds": 86400,
+      "notify_on_ok": false
+    }
+  },
+  "schedule": {
+    "quartz_cron_schedule": "0 0 11 ? * Mon",
+    "timezone_id": "UTC"
+  },
+  "query_lines": [
+    "-- DBU Cost Spike Detection",
+    "-- Compares last 7 days avg daily DBU consumption against 8-week historical baseline",
+    "WITH daily_usage AS (",
+    "  SELECT u.usage_date, ROUND(SUM(u.usage_quantity), 2) AS daily_dbus",
+    "  FROM system.billing.usage u",
+    "  INNER JOIN salama_insurance.salama_silver.workspace_mapping ws",
+    "  on ws.workspace_id = u.workspace_id",
+    "  WHERE u.usage_date >= current_date() - INTERVAL 63 DAYS",
+    "    AND u.usage_date < current_date()",
+    "    AND ws.subscription_name = 'STAR Group Sandbox'",
+    "  GROUP BY u.usage_date",
+    "),",
+    "periods AS (",
+    "  SELECT",
+    "    ROUND(AVG(CASE WHEN usage_date >= current_date() - INTERVAL 7 DAYS THEN daily_dbus END), 2) AS recent_7d_avg,",
+    "    ROUND(AVG(CASE WHEN usage_date < current_date() - INTERVAL 7 DAYS THEN daily_dbus END), 2) AS baseline_8wk_avg,",
+    "    ROUND(MAX(CASE WHEN usage_date >= current_date() - INTERVAL 7 DAYS THEN daily_dbus END), 2) AS recent_7d_peak",
+    "  FROM daily_usage",
+    ")",
+    "SELECT",
+    "  recent_7d_avg AS `Last 7d Avg DBUs`,",
+    "  baseline_8wk_avg AS `Baseline 8wk Avg DBUs`,",
+    "  recent_7d_peak AS `Last 7d Peak DBUs`,",
+    "  ROUND((recent_7d_avg - baseline_8wk_avg) / baseline_8wk_avg * 100, 1) AS `Spike Pct`,",
+    "  CASE ",
+    "    WHEN recent_7d_avg > baseline_8wk_avg * 1.5 THEN 'CRITICAL SPIKE (>50%)'",
+    "    WHEN recent_7d_avg > baseline_8wk_avg * 1.25 THEN 'WARNING SPIKE (>25%)'",
+    "    WHEN recent_7d_avg > baseline_8wk_avg * 1.10 THEN 'ELEVATED (>10%)'",
+    "    ELSE 'NORMAL'",
+    "  END AS `Status`",
+    "FROM periods",
+    "WHERE baseline_8wk_avg > 0"
+  ],
+  "custom_description_lines": [
+    "The last 7-day average DBU consumption has spiked above the 8-week historical baseline by more than 50%. Investigate the top cost drivers in the Account Usage Dashboard.",
+    "",
+    "Account Usage Dashboard Link - https://adb-156147163922340.0.azuredatabricks.net/dashboardsv3/01f1276fb49213f3b52e3ce438d63536/published?o=156147163922340"
+  ]
+}
