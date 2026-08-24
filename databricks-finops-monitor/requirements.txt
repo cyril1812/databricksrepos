@@ -5,3 +5,5 @@ pandas
 numpy
 plotly
 scikit-learn
+fpdf2
+kaleido

@@ -20,6 +20,13 @@ from plotly.subplots import make_subplots
 from databricks import sql
 from databricks.sdk.core import Config
 
+# PDF export for tab-wise downloads
+try:
+    from pdf_export import generate_tab_pdf
+    PDF_EXPORT_AVAILABLE = True
+except ImportError:
+    PDF_EXPORT_AVAILABLE = False
+
 # Import AI FinOps modules
 try:
     from finops_anomaly import (
@@ -43,6 +50,18 @@ try:
     REMEDIATION_MODULE_AVAILABLE = True
 except ImportError:
     REMEDIATION_MODULE_AVAILABLE = False
+
+try:
+    from finops_guardrails import GuardrailEngine
+    GUARDRAIL_MODULE_AVAILABLE = True
+except ImportError:
+    GUARDRAIL_MODULE_AVAILABLE = False
+
+try:
+    from finops_action_plan import ActionPlanGenerator
+    ACTION_PLAN_MODULE_AVAILABLE = True
+except ImportError:
+    ACTION_PLAN_MODULE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Page config & styles
@@ -111,10 +130,17 @@ def get_connection(warehouse_id: str):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def run_query(_conn, query: str) -> pd.DataFrame:
+def run_query(_conn, query: str, resolve_owners: bool = False) -> pd.DataFrame:
     with _conn.cursor() as cur:
         cur.execute(query)
-        return cur.fetchall_arrow().to_pandas()
+        df = cur.fetchall_arrow().to_pandas()
+    if resolve_owners:
+        for col in ["owner", "run_as", "created_by", "owned_by"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).apply(
+                    lambda x: KNOWN_SERVICE_PRINCIPALS.get(x, x) if x else x
+                )
+    return df
 
 
 def run_query_nocache(conn, query: str) -> pd.DataFrame:
@@ -131,6 +157,118 @@ def metric_card(label: str, value, prefix="", suffix=""):
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Identity Resolution — Resolve UUIDs, 'unknown', and SP IDs globally
+# ---------------------------------------------------------------------------
+import re as _re
+
+KNOWN_SERVICE_PRINCIPALS = {
+    "7fa11abe-2286-4e13-9f2c-bbf024d4f240": "SP: Predictive Optimization",
+    "9f1a68cf-9a25-41ce-b85e-059d1c4b6fd6": "SP: Lakehouse Monitor (Data Quality)",
+    "f61e27a7-0ea9-43f8-ba6c-5ad3ef571db0": "SP: SQL Warehouse System",
+    "3da41f72-707d-47f8-8227-ea587c58374a": "SP: Model Serving / AI Functions",
+    "10b233e2-8b72-4f99-9e4f-a3b2aabbf959": "SP: Model Serving (Delta Sharing Proxy)",
+    "7d54e4b8-b257-484b-934e-7ab53bb34d58": "SP: Predictive Optimization (Metrics)",
+    "b17f60f5-7694-469b-a910-940138496295": "SP: Workspace OAuth Client",
+    "faf75d25-3cda-4042-92af-4180d1abf2df": "SP: Account Service",
+}
+
+_UUID_PATTERN = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def resolve_identity(owner_value):
+    """Resolve owner identity globally — maps UUIDs to SP names, annotates unknown."""
+    if not owner_value or owner_value in ("system", "None", "nan"):
+        return "system"
+    owner_value = str(owner_value).strip()
+    if owner_value in KNOWN_SERVICE_PRINCIPALS:
+        return KNOWN_SERVICE_PRINCIPALS[owner_value]
+    if _UUID_PATTERN.match(owner_value):
+        return f"SP: {owner_value[:8]}..."
+    if owner_value == "unknown":
+        return "unknown (system-managed)"
+    return owner_value
+
+
+def resolve_identity_column(df, col="owner"):
+    """Apply resolve_identity to an entire DataFrame column in-place."""
+    if col in df.columns:
+        df[col] = df[col].astype(str).apply(resolve_identity)
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_vs_endpoint_creators(_conn):
+    """Cached: query audit log for Vector Search endpoint creators."""
+    try:
+        query = """
+        SELECT
+            a.user_identity.email AS creator,
+            COALESCE(a.request_params['name'], a.request_params['endpoint_name']) AS resource_name,
+            a.action_name,
+            a.event_date
+        FROM system.access.audit a
+        WHERE a.event_date >= DATEADD(DAY, -180, CURRENT_DATE())
+          AND a.service_name = 'vectorSearch'
+          AND a.action_name IN ('createEndpoint', 'createVectorIndex')
+        ORDER BY a.event_date DESC
+        """
+        df = run_query(_conn, query)
+        creators = {}
+        for _, row in df.iterrows():
+            name = str(row.get("resource_name", ""))
+            creator = str(row.get("creator", ""))
+            if name and creator:
+                creators[name] = creator
+        return creators
+    except Exception:
+        return {}
+
+
+def resolve_unknown_vs_owners(df, conn, owner_col="owner", product_col=None):
+    """For rows with 'unknown (system-managed)' + VECTOR_SEARCH product,
+    resolve to the actual VS endpoint creator via audit log."""
+    if product_col and product_col in df.columns:
+        vs_mask = (
+            (df[owner_col].str.contains("unknown", case=False, na=False)) &
+            (df[product_col].str.contains("VECTOR_SEARCH", case=False, na=False))
+        )
+    else:
+        vs_mask = df[owner_col].str.contains("unknown", case=False, na=False)
+
+    if vs_mask.any():
+        creators = get_vs_endpoint_creators(conn)
+        if creators:
+            # Use the most recent VS creator as default attribution
+            default_creator = next(iter(creators.values()), None)
+            if default_creator:
+                df.loc[vs_mask, owner_col] = df.loc[vs_mask, owner_col].apply(
+                    lambda x: f"{default_creator} (VS creator)" if "unknown" in str(x).lower() else x
+                )
+    return df
+
+
+# SQL helper: wrap owner column with SP resolution in SQL queries
+def sql_resolve_owner_expr(alias="owner"):
+    """Returns a SQL CASE expression that resolves known SP UUIDs inline."""
+    cases = "\n".join(
+        f"        WHEN {{col}} = '{uuid}' THEN '{name}'"
+        for uuid, name in KNOWN_SERVICE_PRINCIPALS.items()
+    )
+    return f"""CASE
+{cases}
+        WHEN {{col}} RLIKE '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-' THEN CONCAT('SP: ', LEFT({{col}}, 8), '...')
+        WHEN {{col}} = 'unknown' THEN 'unknown (system-managed)'
+        WHEN {{col}} IS NULL THEN 'system'
+        ELSE {{col}}
+    END AS {alias}"""
+
+
+OWNER_RESOLVE_SQL = sql_resolve_owner_expr("owner").replace(
+    "{col}", "COALESCE(u.identity_metadata.run_as, u.identity_metadata.created_by, 'system')")
+
+
 # ---------------------------------------------------------------------------
 # Workspace & Subscription Helpers
 # ---------------------------------------------------------------------------
@@ -141,7 +279,7 @@ def load_workspace_mapping(_conn):
         df_ws = run_query(_conn,
             "SELECT CAST(workspace_id AS STRING) AS workspace_id, "
             "workspace_name, subscription_name, resource_group, location "
-            "FROM salama_insurance.salama_silver.workspace_mapping "
+            "FROM uae_insurance.uae_silver.workspace_mapping "
             "WHERE workspace_name IS NOT NULL"
         )
         ws_name_map = dict(zip(
@@ -212,6 +350,24 @@ with st.sidebar:
         help="Filter all metrics to workspaces in the selected Azure subscriptions.",
     )
     sub_ws_ids = get_ws_ids_for_subscriptions(WS_SUBSCRIPTION_MAP, ALL_SUBSCRIPTIONS, selected_subscriptions)
+
+    # Workspace Name filter
+    ALL_WORKSPACE_NAMES = sorted(WS_NAME_MAP.values()) if WS_NAME_MAP else []
+    selected_workspaces = st.multiselect(
+        "🏢 Workspace",
+        options=ALL_WORKSPACE_NAMES,
+        default=ALL_WORKSPACE_NAMES,
+        help="Filter all metrics to specific workspaces by name.",
+    )
+    # Apply workspace name filter — intersect with subscription filter
+    if selected_workspaces and set(selected_workspaces) != set(ALL_WORKSPACE_NAMES):
+        ws_name_to_ids = {name: wid for wid, name in WS_NAME_MAP.items()}
+        ws_name_filtered_ids = [ws_name_to_ids[name] for name in selected_workspaces if name in ws_name_to_ids]
+        if sub_ws_ids is not None:
+            sub_ws_ids = [wid for wid in sub_ws_ids if wid in ws_name_filtered_ids]
+        else:
+            sub_ws_ids = ws_name_filtered_ids
+
     st.subheader("Filters")
     date_range = st.date_input(
         "Date range",
@@ -242,13 +398,14 @@ ED = end_date.isoformat()
 # ===========================================================================
 # TAB LAYOUT — 7 tabs including AI features, Budget & Remediation
 # ===========================================================================
-tab_jobs, tab_cost, tab_forecast, tab_perf, tab_budget, tab_remediation, tab_agent = st.tabs([
+tab_jobs, tab_cost, tab_forecast, tab_perf, tab_budget, tab_remediation, tab_action, tab_agent = st.tabs([
     "🔧 Job Monitoring",
     "💰 Cost & FinOps",
     "🔮 AI Cost Forecast",
     "⚡ Performance",
     "🎯 Budget & Anomaly",
-    "🛡️ Auto-Remediation",
+    "🛡️ Guardrails & Remediation",
+    "📋 Action Plan",
     "🤖 AI FinOps Agent",
 ])
 
@@ -440,7 +597,9 @@ with tab_jobs:
             options=["All Jobs"] + sorted(df_runs["job_name"].dropna().unique().tolist()),
         )
         df_display = df_runs if job_filter == "All Jobs" else df_runs[df_runs["job_name"] == job_filter]
-        display_cols = ["job_name", "run_id", "result_state", "trigger_type",
+        # Map workspace_id to workspace_name for display
+        df_display["workspace_name"] = df_display["workspace_id"].astype(str).str.strip().map(WS_NAME_MAP).fillna("Unknown")
+        display_cols = ["workspace_name", "job_name", "run_id", "result_state", "trigger_type",
                         "run_start", "run_end", "duration_min", "exec_duration_sec",
                         "setup_sec", "queue_sec", "sla_breach"]
         available = [c for c in display_cols if c in df_display.columns]
@@ -451,6 +610,30 @@ with tab_jobs:
                      })
         csv = df_display[available].to_csv(index=False)
         st.download_button("📥 Export Job Runs CSV", csv, "job_runs.csv", "text/csv")
+
+        # --- PDF Download ---
+        if PDF_EXPORT_AVAILABLE:
+            st.markdown("---")
+            if st.button("📄 Download Tab as PDF", key="pdf_jobs"):
+                with st.spinner("Generating PDF..."):
+                    pdf_bytes = generate_tab_pdf(
+                        tab_title="Job Monitoring Dashboard",
+                        date_range=f"{start_date} to {end_date}",
+                        metrics={
+                            "Total Runs": f"{total_runs:,}",
+                            "Failed Runs": f"{failed_runs:,}",
+                            "Success Rate": f"{success_rate}%",
+                            "Avg Duration": f"{avg_duration} min",
+                            "SLA Breaches": f"{sla_breaches:,}",
+                        },
+                        figures=[(fig, "Run Outcomes Over Time"), (fig2, "Duration Distribution")],
+                        dataframes=[(df_display[available].head(100), "Job Runs Detail", 100)],
+                    )
+                    st.download_button(
+                        "⬇️ Download PDF", pdf_bytes,
+                        file_name="finops_job_monitoring.pdf",
+                        mime="application/pdf", key="pdf_jobs_dl"
+                    )
 
 
 # ===========================================================================
@@ -855,7 +1038,7 @@ with tab_cost:
             )
             fig_ws_bar.update_traces(textposition="outside")
             fig_ws_bar.update_layout(
-                height=max(250, len(ws_summary) * 55),
+                height=350,
                 margin=dict(l=20, r=80, t=30, b=20),
                 showlegend=False, coloraxis_showscale=False
             )
@@ -867,8 +1050,21 @@ with tab_cost:
                 ws_summary, names="workspace_label", values="total_cost",
                 hole=0.45, color_discrete_sequence=px.colors.qualitative.Set2
             )
-            fig_ws_pie.update_layout(height=max(250, len(ws_summary) * 55),
-                                      margin=dict(l=20, r=20, t=30, b=20))
+            fig_ws_pie.update_traces(textposition="inside", textinfo="percent")
+            fig_ws_pie.update_layout(
+                height=350,
+                margin=dict(l=10, r=10, t=30, b=20),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=-0.3,
+                    xanchor="center",
+                    x=0.5,
+                    font=dict(size=11)
+                ),
+                uniformtext_minsize=10,
+                uniformtext_mode="hide"
+            )
             st.plotly_chart(fig_ws_pie, use_container_width=True)
 
         # Daily trend by workspace (stacked area)
@@ -967,8 +1163,159 @@ with tab_cost:
         else:
             st.success("No cost anomalies detected (threshold: 2σ above mean).")
 
+        # ---- Week-on-Week / Monthly Cost Trend Analysis ----
+        st.markdown("---")
+        st.subheader("📈 Period-over-Period Cost Trend")
+        st.caption("Week-on-week and monthly cost trends by resource — identify spikes and top cost drivers")
+
+        # Prepare time-based columns
+        df_trend = df_cost_filtered.copy()
+        df_trend["usage_date"] = pd.to_datetime(df_trend["usage_date"])
+        df_trend["week"] = df_trend["usage_date"].dt.isocalendar().week.astype(int)
+        df_trend["year_week"] = df_trend["usage_date"].dt.strftime("%Y-W%V")
+        df_trend["month"] = df_trend["usage_date"].dt.to_period("M").astype(str)
+
+        # Determine resource name for grouping
+        df_trend["resource_name"] = df_trend.apply(
+            lambda r: r["job_name"] if pd.notna(r.get("job_name")) and r["job_name"] != ""
+            else r.get("warehouse_name") if pd.notna(r.get("warehouse_name")) and r.get("warehouse_name", "") != ""
+            else r.get("endpoint_name") if pd.notna(r.get("endpoint_name")) and r.get("endpoint_name", "") != ""
+            else r.get("app_name") if pd.notna(r.get("app_name")) and r.get("app_name", "") != ""
+            else r.get("billing_origin_product", "Other"),
+            axis=1
+        )
+
+        period_choice = st.radio(
+            "Trend Period", ["Weekly", "Monthly"], horizontal=True, key="trend_period"
+        )
+        period_col = "year_week" if period_choice == "Weekly" else "month"
+
+        # Aggregate cost by period and resource
+        period_resource = df_trend.groupby([period_col, "resource_name"]).agg(
+            cost=("estimated_cost", "sum"),
+            dbus=("dbus", "sum")
+        ).reset_index().sort_values([period_col, "cost"], ascending=[True, False])
+
+        # Total cost by period
+        period_total = df_trend.groupby(period_col).agg(
+            cost=("estimated_cost", "sum")).reset_index().sort_values(period_col)
+
+        # Calculate period-over-period change
+        period_total["prev_cost"] = period_total["cost"].shift(1)
+        period_total["change_pct"] = ((period_total["cost"] - period_total["prev_cost"]) / period_total["prev_cost"] * 100).round(1)
+        period_total["change_abs"] = period_total["cost"] - period_total["prev_cost"]
+
+        # KPI: Latest period vs previous
+        if len(period_total) >= 2:
+            latest = period_total.iloc[-1]
+            prev = period_total.iloc[-2]
+            change_pct = latest["change_pct"]
+            trend_kc1, trend_kc2, trend_kc3, trend_kc4 = st.columns(4)
+            with trend_kc1:
+                metric_card(f"Current ({latest[period_col]})", f"${latest['cost']:,.0f}")
+            with trend_kc2:
+                metric_card(f"Previous ({prev[period_col]})", f"${prev['cost']:,.0f}")
+            with trend_kc3:
+                direction = "↑" if change_pct > 0 else "↓" if change_pct < 0 else "→"
+                color_indicator = "🔴" if change_pct > 10 else "🟡" if change_pct > 0 else "🟢"
+                metric_card("Change %", f"{color_indicator} {direction} {abs(change_pct):.1f}%")
+            with trend_kc4:
+                metric_card("Change ($)", f"${latest['change_abs']:+,.0f}")
+
+        # --- Chart 1: Total cost trend with period-over-period bars ---
+        trend_c1, trend_c2 = st.columns(2)
+        with trend_c1:
+            st.markdown(f"**Total Cost by {period_choice} Period**")
+            fig_period = go.Figure()
+            colors = ["#4caf50" if (row["change_pct"] <= 0 or pd.isna(row["change_pct"]))
+                       else "#ff9800" if row["change_pct"] <= 20
+                       else "#e94560"
+                       for _, row in period_total.iterrows()]
+            fig_period.add_trace(go.Bar(
+                x=period_total[period_col], y=period_total["cost"],
+                marker_color=colors,
+                text=period_total["cost"].apply(lambda x: f"${x:,.0f}"),
+                textposition="outside",
+                hovertemplate="%{x}<br>Cost: $%{y:,.0f}<extra></extra>"
+            ))
+            # Add change % annotations
+            for idx, row in period_total.iterrows():
+                if pd.notna(row["change_pct"]):
+                    fig_period.add_annotation(
+                        x=row[period_col], y=row["cost"],
+                        text=f"{row['change_pct']:+.1f}%",
+                        showarrow=False, yshift=25,
+                        font=dict(size=10, color="#e94560" if row["change_pct"] > 0 else "#4caf50")
+                    )
+            fig_period.update_layout(
+                height=380, margin=dict(l=20, r=20, t=40, b=20),
+                showlegend=False, yaxis_title="Cost ($)"
+            )
+            st.plotly_chart(fig_period, use_container_width=True)
+
+        with trend_c2:
+            st.markdown(f"**Top Cost Drivers by {period_choice} Period**")
+            # Get top 8 resources by total cost
+            top_resources = period_resource.groupby("resource_name")["cost"].sum().nlargest(8).index.tolist()
+            top_period_data = period_resource[period_resource["resource_name"].isin(top_resources)]
+            fig_stacked = px.bar(
+                top_period_data, x=period_col, y="cost", color="resource_name",
+                labels={"cost": "Cost ($)", period_col: "Period", "resource_name": "Resource"},
+                color_discrete_sequence=px.colors.qualitative.Set2
+            )
+            fig_stacked.update_layout(
+                height=380, margin=dict(l=20, r=20, t=40, b=20),
+                barmode="stack",
+                legend=dict(orientation="h", y=-0.3, xanchor="center", x=0.5, font=dict(size=10))
+            )
+            st.plotly_chart(fig_stacked, use_container_width=True)
+
+        # --- Resource-level WoW/MoM change table ---
+        st.markdown(f"**Resource Cost Changes ({period_choice})**")
+
+        # Get last two periods
+        sorted_periods = sorted(period_resource[period_col].unique())
+        if len(sorted_periods) >= 2:
+            current_period = sorted_periods[-1]
+            previous_period = sorted_periods[-2]
+
+            curr_costs = period_resource[period_resource[period_col] == current_period][["resource_name", "cost"]].rename(columns={"cost": "current_cost"})
+            prev_costs = period_resource[period_resource[period_col] == previous_period][["resource_name", "cost"]].rename(columns={"cost": "previous_cost"})
+
+            change_df = curr_costs.merge(prev_costs, on="resource_name", how="outer").fillna(0)
+            change_df["change_abs"] = change_df["current_cost"] - change_df["previous_cost"]
+            change_df["change_pct"] = ((change_df["current_cost"] - change_df["previous_cost"])
+                                        / change_df["previous_cost"].replace(0, np.nan) * 100).round(1)
+            change_df = change_df.sort_values("change_abs", ascending=False)
+
+            # Highlight spikes (>20% increase)
+            spikes_df = change_df[change_df["change_pct"] > 20].head(10)
+            if not spikes_df.empty:
+                st.markdown(f'<div class="warning-box">⚠️ <strong>{len(spikes_df)} resource(s) spiked >20%</strong> '
+                            f'from {previous_period} → {current_period}</div>', unsafe_allow_html=True)
+
+            # Display table
+            change_display = change_df.head(20).copy()
+            change_display["current_cost"] = change_display["current_cost"].apply(lambda x: f"${x:,.2f}")
+            change_display["previous_cost"] = change_display["previous_cost"].apply(lambda x: f"${x:,.2f}")
+            change_display["change_abs"] = change_display["change_abs"].apply(lambda x: f"${x:+,.2f}")
+            change_display["change_pct"] = change_display["change_pct"].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "New")
+            change_display.columns = ["Resource", f"Current ({current_period})", f"Previous ({previous_period})",
+                                       "Change ($)", "Change (%)"]
+            st.dataframe(change_display, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "📥 Export Period Comparison CSV",
+                change_df.to_csv(index=False), "period_cost_comparison.csv", "text/csv",
+                key="export_period_comparison"
+            )
+        else:
+            st.info("Need at least 2 periods in the date range for comparison. Try expanding the date range.")
+
         with st.expander("📋 Detailed Cost Data"):
-            cost_cols = ["usage_date", "workspace_id", "billing_origin_product", "asset_name",
+            # Add workspace_name column for display
+            df_cost_filtered["workspace_name"] = df_cost_filtered["workspace_id"].astype(str).str.strip().map(WS_NAME_MAP).fillna("Unknown")
+            cost_cols = ["usage_date", "workspace_name", "workspace_id", "billing_origin_product", "asset_name",
                          "asset_type", "app_name", "warehouse_name", "endpoint_name",
                          "job_name", "notebook_path", "sku_name",
                          "user_identity", "created_by", "dbus", "estimated_cost"]
@@ -982,6 +1329,159 @@ with tab_cost:
 # ===========================================================================
 # TAB 3 — AI COST FORECAST (using ai_forecast)
 # ===========================================================================
+
+    # -----------------------------------------------------------------------
+    # Monthly DBU Consumption Report (Jan 2026 onwards)
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("📊 Monthly DBU Consumption Report")
+    st.caption("Consolidated monthly breakdown by subscription & service — Jan 2026 to present")
+
+    monthly_report_query = f"""
+    SELECT
+      DATE_FORMAT(DATE_TRUNC('MONTH', u.usage_date), 'yyyy-MM') AS month,
+      wm.subscription_name AS subscription,
+      u.billing_origin_product AS service,
+      ROUND(SUM(CAST(u.usage_quantity AS DOUBLE)), 2) AS total_dbus,
+      ROUND(SUM(
+        CAST(u.usage_quantity AS DOUBLE) *
+        COALESCE(CAST(p.pricing.effective_list.default AS DOUBLE), 0)
+      ), 2) AS cost_usd
+    FROM system.billing.usage u
+    LEFT JOIN system.billing.list_prices p
+      ON u.sku_name = p.sku_name
+      AND u.usage_date >= p.price_start_time
+      AND (p.price_end_time IS NULL OR u.usage_date < p.price_end_time)
+    INNER JOIN uae_insurance.uae_silver.workspace_mapping wm
+      ON u.workspace_id = wm.workspace_id
+    WHERE u.usage_date >= '2026-01-01'
+      AND u.usage_date <= CURRENT_DATE()
+      {ws_sql_filter('u.workspace_id', sub_ws_ids)}
+    GROUP BY 1, 2, 3
+    HAVING cost_usd > 0
+    ORDER BY 1, 2, 5 DESC
+    """
+
+    try:
+        df_monthly = run_query(conn, monthly_report_query)
+        if not df_monthly.empty:
+            # Summary metrics
+            total_cost = df_monthly["cost_usd"].sum()
+            total_dbus_all = df_monthly["total_dbus"].sum()
+            num_months = df_monthly["month"].nunique()
+            avg_monthly = total_cost / num_months if num_months > 0 else 0
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            with mc1:
+                metric_card("Total DBU Cost (YTD)", f"${total_cost:,.0f}")
+            with mc2:
+                metric_card("Total DBUs Consumed", f"{total_dbus_all:,.0f}")
+            with mc3:
+                metric_card("Avg Monthly Cost", f"${avg_monthly:,.0f}")
+            with mc4:
+                metric_card("Months Tracked", f"{num_months}")
+
+            st.markdown("")
+
+            # --- Visualization 1: Stacked bar by service ---
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                df_svc = df_monthly.groupby(["month", "service"], as_index=False)["cost_usd"].sum()
+                df_svc = df_svc.sort_values("month")
+                fig_svc = px.bar(
+                    df_svc, x="month", y="cost_usd", color="service",
+                    title="Monthly Cost by Service",
+                    labels={"cost_usd": "Cost (USD)", "month": "Month", "service": "Service"},
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_svc.update_layout(
+                    barmode="stack", height=420,
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.45),
+                    margin=dict(l=40, r=20, t=40, b=100),
+                )
+                st.plotly_chart(fig_svc, use_container_width=True)
+
+            # --- Visualization 2: Grouped bar by subscription ---
+            with col_v2:
+                df_sub = df_monthly.groupby(["month", "subscription"], as_index=False)["cost_usd"].sum()
+                df_sub = df_sub.sort_values("month")
+                fig_sub = px.bar(
+                    df_sub, x="month", y="cost_usd", color="subscription",
+                    title="Monthly Cost by Subscription",
+                    labels={"cost_usd": "Cost (USD)", "month": "Month", "subscription": "Subscription"},
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                )
+                fig_sub.update_layout(
+                    barmode="group", height=420,
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.45),
+                    margin=dict(l=40, r=20, t=40, b=100),
+                )
+                st.plotly_chart(fig_sub, use_container_width=True)
+
+            # --- Visualization 3: Trend line per subscription ---
+            df_trend = df_monthly.groupby(["month", "subscription"], as_index=False)["cost_usd"].sum()
+            df_trend = df_trend.sort_values("month")
+            fig_trend = px.line(
+                df_trend, x="month", y="cost_usd", color="subscription",
+                title="Monthly Spend Trend by Subscription",
+                markers=True,
+                labels={"cost_usd": "Cost (USD)", "month": "Month", "subscription": "Subscription"},
+            )
+            fig_trend.update_layout(height=350, margin=dict(l=40, r=20, t=40, b=40))
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+            # --- Full Data Table (copyable to Excel) ---
+            st.markdown("**Full Report Data** _— select rows and copy to Excel, or download CSV_")
+            st.dataframe(
+                df_monthly[["month", "subscription", "service", "total_dbus", "cost_usd"]].rename(
+                    columns={"month": "Month", "subscription": "Subscription", "service": "Service",
+                             "total_dbus": "Total DBUs", "cost_usd": "Cost (USD)"}),
+                use_container_width=True,
+                height=400,
+            )
+
+            # --- CSV Download ---
+            csv_data = df_monthly.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Report as CSV",
+                data=csv_data,
+                file_name="dbu_monthly_report.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No billing data found for the selected period.")
+    except Exception as e:
+        st.warning(f"Monthly report query failed: {e}")
+
+    # --- PDF Download for Cost tab ---
+    if PDF_EXPORT_AVAILABLE and not df_cost_filtered.empty:
+        st.markdown("---")
+        if st.button("📄 Download Tab as PDF", key="pdf_cost"):
+            with st.spinner("Generating PDF..."):
+                pdf_bytes = generate_tab_pdf(
+                    tab_title="Cost & FinOps Dashboard",
+                    date_range=f"{start_date} to {end_date}",
+                    metrics={
+                        "Total Cost": f"${total_cost:,.0f}",
+                        "Total DBUs": f"{total_dbus:,.0f}",
+                        "Unique Jobs": f"{unique_jobs:,}",
+                        "Avg Daily": f"${daily_avg:,.0f}",
+                    },
+                    figures=[(fig, "Daily Cost Trend"), (fig2, "Cost by Product")],
+                    dataframes=[
+                        (df_cost_filtered.groupby("billing_origin_product").agg(
+                            cost=("estimated_cost", "sum"), dbus=("dbus", "sum")
+                        ).reset_index().sort_values("cost", ascending=False).head(20),
+                         "Cost by Product", 20),
+                    ],
+                )
+                st.download_button(
+                    "⬇️ Download PDF", pdf_bytes,
+                    file_name="finops_cost_dashboard.pdf",
+                    mime="application/pdf", key="pdf_cost_dl"
+                )
+
+
 with tab_forecast:
     st.header("🔮 AI Cost Forecasting")
     st.caption("Powered by Databricks `ai_forecast()` — predicts future costs using historical billing data")
@@ -1213,6 +1713,33 @@ with tab_forecast:
                 st.error(f"Forecast failed: {e}")
                 st.info("Ensure your SQL warehouse supports `ai_forecast()` (requires serverless or Pro warehouse).")
 
+    # --- PDF Download for Forecast tab ---
+    if PDF_EXPORT_AVAILABLE:
+        st.markdown("---")
+        if st.button("📄 Download Tab as PDF", key="pdf_forecast"):
+            with st.spinner("Generating PDF..."):
+                figs = []
+                dfs = []
+                try:
+                    if 'fig' in dir() and fig is not None:
+                        figs.append((fig, "Cost Forecast"))
+                    if 'df_forecast' in dir() and df_forecast is not None and not df_forecast.empty:
+                        dfs.append((df_forecast, "Forecast Data", 50))
+                except Exception:
+                    pass
+                pdf_bytes = generate_tab_pdf(
+                    tab_title="AI Cost Forecasting",
+                    date_range=f"{start_date} to {end_date} (Forecast: {forecast_days} days)",
+                    figures=figs if figs else None,
+                    dataframes=dfs if dfs else None,
+                    text_sections=[("Configuration", f"Forecast horizon: {forecast_days} days | Granularity: {forecast_group}")],
+                )
+                st.download_button(
+                    "⬇️ Download PDF", pdf_bytes,
+                    file_name="finops_forecast.pdf",
+                    mime="application/pdf", key="pdf_forecast_dl"
+                )
+
 
 # ===========================================================================
 # TAB 4 — PERFORMANCE INSIGHTS (with AI Recommendations)
@@ -1266,7 +1793,7 @@ with tab_perf:
             df_nodes[col] = pd.to_numeric(df_nodes[col], errors="coerce").fillna(0)
 
         cluster_summary = df_nodes.groupby(
-            ["cluster_id", "cluster_name", "owned_by", "worker_node_type",
+            ["workspace_id", "cluster_id", "cluster_name", "owned_by", "worker_node_type",
              "worker_count", "auto_termination_minutes", "cluster_source"]
         ).agg(avg_cpu=("avg_cpu_pct", "mean"), max_cpu=("max_cpu_pct", "max"),
                avg_mem=("avg_mem_pct", "mean"), max_mem=("max_mem_pct", "max"),
@@ -1413,7 +1940,10 @@ with tab_perf:
                                 f'(CPU: {row["avg_cpu"]:.0f}%): {rec}</div>', unsafe_allow_html=True)
 
         with st.expander("📋 Cluster Details"):
-            detail_cols = ["cluster_name", "cluster_id", "owned_by", "worker_node_type",
+            # Add workspace_name if workspace_id is available
+            if "workspace_id" in cluster_summary.columns:
+                cluster_summary["workspace_name"] = cluster_summary["workspace_id"].astype(str).str.strip().map(WS_NAME_MAP).fillna("Unknown")
+            detail_cols = ["workspace_name", "cluster_name", "cluster_id", "owned_by", "worker_node_type",
                            "worker_count", "auto_termination_minutes", "cluster_source",
                            "avg_cpu", "max_cpu", "avg_mem", "days_active", "utilization_class"]
             avail = [c for c in detail_cols if c in cluster_summary.columns]
@@ -1425,6 +1955,30 @@ with tab_perf:
             st.download_button("📥 Export Cluster CSV",
                                cluster_summary[avail].to_csv(index=False),
                                "cluster_perf.csv", "text/csv")
+
+        # --- PDF Download for Performance tab ---
+        if PDF_EXPORT_AVAILABLE:
+            st.markdown("---")
+            if st.button("📄 Download Tab as PDF", key="pdf_perf"):
+                with st.spinner("Generating PDF..."):
+                    perf_metrics = {
+                        "Active Clusters": f"{total_clusters:,}",
+                        "Underutilized": f"{idle_clusters:,}",
+                        "Over-loaded": f"{overloaded:,}",
+                        "Avg CPU": f"{avg_cpu_all}%",
+                    }
+                    pdf_bytes = generate_tab_pdf(
+                        tab_title="Performance & Cluster Insights",
+                        date_range=f"{start_date} to {end_date}",
+                        metrics=perf_metrics,
+                        figures=[(fig, "Cluster Utilization"), (fig2, "CPU Over Time")],
+                        dataframes=[(cluster_summary[avail].head(50), "Cluster Summary", 50)],
+                    )
+                    st.download_button(
+                        "⬇️ Download PDF", pdf_bytes,
+                        file_name="finops_performance.pdf",
+                        mime="application/pdf", key="pdf_perf_dl"
+                    )
 
 
 # ===========================================================================
@@ -1711,248 +2265,614 @@ with tab_budget:
                     import traceback
                     st.code(traceback.format_exc())
 
+        # --- PDF Download for Budget & Anomaly tab ---
+        if PDF_EXPORT_AVAILABLE:
+            st.markdown("---")
+            if st.button("📄 Download Tab as PDF", key="pdf_budget"):
+                with st.spinner("Generating PDF..."):
+                    budget_dfs = []
+                    budget_text = []
+                    try:
+                        if 'df_anomalies' in st.session_state and st.session_state['df_anomalies'] is not None:
+                            budget_dfs.append((st.session_state['df_anomalies'].head(50), "Anomaly Data", 50))
+                        if 'anomaly_summary' in st.session_state:
+                            budget_text.append(("Anomaly Summary", str(st.session_state['anomaly_summary'])))
+                    except Exception:
+                        pass
+                    pdf_bytes = generate_tab_pdf(
+                        tab_title="Budget Management & Anomaly Detection",
+                        date_range=f"{start_date} to {end_date}",
+                        dataframes=budget_dfs if budget_dfs else None,
+                        text_sections=budget_text if budget_text else [("Status", "Budget & anomaly analysis complete.")],
+                    )
+                    st.download_button(
+                        "⬇️ Download PDF", pdf_bytes,
+                        file_name="finops_budget_anomaly.pdf",
+                        mime="application/pdf", key="pdf_budget_dl"
+                    )
+
 
 # ===========================================================================
-# TAB 6 — AUTO-REMEDIATION DASHBOARD (NEW!)
+# TAB 6 — GUARDRAILS & REMEDIATION
 # ===========================================================================
 with tab_remediation:
-    st.header("🛡️ Auto-Remediation Engine")
-    st.caption("AI-powered cost control with automated remediation actions")
+    st.header("🛡️ Guardrails & Remediation Engine")
+    st.caption("Automated cost guardrails, policy enforcement, and remediation actions")
 
     if not REMEDIATION_MODULE_AVAILABLE:
         st.warning(
             "Remediation module not available. Ensure finops_remediation.py "
             "is in the same directory as app.py."
         )
+
+    guardrails_available = GUARDRAIL_MODULE_AVAILABLE if 'GUARDRAIL_MODULE_AVAILABLE' in dir() else False
+    if not guardrails_available:
+        st.warning(
+            "Guardrails module not available. Ensure finops_guardrails.py "
+            "is in the same directory as app.py."
+        )
+
+    # ---- Guardrail Configuration ----
+    with st.expander("⚙️ Guardrail Configuration", expanded=False):
+        gc1, gc2, gc3, gc4 = st.columns(4)
+        with gc1:
+            gr_monthly_budget = st.number_input(
+                "Monthly Budget ($)", min_value=100, value=5000, step=500,
+                help="Total monthly DBU budget in dollars",
+                key="gr_budget"
+            )
+            gr_max_workers = st.number_input(
+                "Max Workers per Cluster", min_value=1, value=20, step=5,
+                help="Flag clusters exceeding this worker count",
+                key="gr_max_workers"
+            )
+        with gc2:
+            gr_idle_threshold = st.number_input(
+                "Idle Threshold (min)", min_value=15, value=120, step=15,
+                help="Terminate clusters idle longer than this",
+                key="gr_idle_min"
+            )
+            gr_budget_critical_pct = st.slider(
+                "Budget Critical %", min_value=50, max_value=100, value=95,
+                help="Hard limit: auto-terminate interactive clusters above this %",
+                key="gr_budget_pct"
+            )
+        with gc3:
+            gr_max_job_duration = st.number_input(
+                "Max Job Duration (min)", min_value=30, value=360, step=30,
+                help="Flag/cancel jobs running longer than this",
+                key="gr_max_job_dur"
+            )
+            gr_app_idle_hours = st.number_input(
+                "App Idle Hours", min_value=1, value=8, step=1,
+                help="Stop apps running longer than this",
+                key="gr_app_idle_hrs"
+            )
+        with gc4:
+            gr_required_tags = st.multiselect(
+                "Required Tags",
+                options=["project", "owner", "env", "team", "cost_center", "department"],
+                default=["project", "owner", "env"],
+                help="Tags that must exist on all clusters",
+                key="gr_req_tags"
+            )
+            gr_dry_run = st.toggle(
+                "🛡️ Dry Run Mode", value=True,
+                help="When ON, actions are simulated. When OFF, actions are executed.",
+                key="gr_dry_run"
+            )
+
+    if gr_dry_run:
+        st.info("🛡️ **Dry Run Mode** — All actions will be simulated. No changes will be made.")
     else:
-        # Initialize session state for audit log
+        st.warning("⚠️ **LIVE MODE** — Actions will be executed! Use with caution.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # GUARDRAILS SECTION
+    # ================================================================
+    if guardrails_available:
+        # Initialize session state
+        if "guardrail_report" not in st.session_state:
+            st.session_state["guardrail_report"] = None
+
+        col_scan, col_enforce = st.columns([3, 1])
+        with col_scan:
+            run_scan = st.button("🔍 Run Guardrail Scan", type="primary",
+                                 key="gr_run_scan", use_container_width=True)
+        with col_enforce:
+            run_enforce = st.button("🚀 Execute All Actions", key="gr_enforce",
+                                    use_container_width=True,
+                                    disabled=gr_dry_run)
+
+        if run_scan or run_enforce:
+            effective_dry_run = gr_dry_run if not run_enforce else False
+            engine = GuardrailEngine(conn, dry_run=effective_dry_run)
+            config = {
+                "max_workers": gr_max_workers,
+                "required_tags": gr_required_tags,
+                "budget_critical_pct": gr_budget_critical_pct,
+                "idle_threshold_min": gr_idle_threshold,
+                "max_job_duration_min": gr_max_job_duration,
+                "max_daily_job_cost": 100,
+                "app_idle_hours": gr_app_idle_hours,
+            }
+            with st.spinner("Running guardrail scan..."):
+                report = engine.run_full_scan(
+                    monthly_budget=gr_monthly_budget, config=config)
+                report["_audit_df"] = engine.get_audit_log()
+                st.session_state["guardrail_report"] = report
+
+        report = st.session_state.get("guardrail_report")
+        if report:
+            s = report["summary"]
+
+            # ---- Summary Metrics Row ----
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                metric_card("Total Violations", s["total_violations"])
+            with m2:
+                metric_card("Critical Issues", s["critical_count"])
+            with m3:
+                metric_card("Est. Daily Savings",
+                            f"${s['estimated_daily_savings']:,.0f}")
+            with m4:
+                score = s["compliance_score"]
+                metric_card("Compliance Score", f"{score}%")
+
+            st.markdown("---")
+
+            # ---- Budget Status with Gauge ----
+            st.subheader("💰 Budget Status")
+            bs = report["budget_status"]
+            budget_pct = bs.get("utilization_pct", 0)
+
+            b1, b2 = st.columns([2, 1])
+            with b1:
+                fig_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number+delta",
+                    value=budget_pct,
+                    number={"suffix": "%"},
+                    delta={"reference": gr_budget_critical_pct, "relative": False},
+                    title={"text": "Budget Utilization"},
+                    gauge={
+                        "axis": {"range": [0, 120], "ticksuffix": "%"},
+                        "bar": {"color": "#00b4d8"},
+                        "steps": [
+                            {"range": [0, 50], "color": "#1b2d1b"},
+                            {"range": [50, 75], "color": "#2d2a1b"},
+                            {"range": [75, 95], "color": "#3d2a1b"},
+                            {"range": [95, 120], "color": "#4d1b1b"},
+                        ],
+                        "threshold": {
+                            "line": {"color": "#e94560", "width": 3},
+                            "thickness": 0.75,
+                            "value": gr_budget_critical_pct,
+                        },
+                    },
+                ))
+                fig_gauge.update_layout(
+                    height=280,
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font={"color": "#a0a0b0"},
+                )
+                st.plotly_chart(fig_gauge, use_container_width=True)
+            with b2:
+                st.metric("Current Spend", f"${bs.get('current_spend', 0):,.0f}")
+                st.metric("Monthly Budget", f"${bs.get('budget', 0):,.0f}")
+                if bs.get("threshold_exceeded"):
+                    st.markdown(
+                        '<div class="alert-box">🚨 <strong>BUDGET CRITICAL</strong> — '
+                        'Interactive clusters will be terminated!</div>',
+                        unsafe_allow_html=True)
+                    for act in bs.get("actions_taken", []):
+                        st.markdown(f"- {act}")
+                else:
+                    st.markdown(
+                        '<div class="success-box">✅ Budget within limits</div>',
+                        unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ---- Cluster Compliance ----
+            gc_left, gc_right = st.columns(2)
+            with gc_left:
+                st.subheader("🖥️ Cluster Compliance")
+                cv = report.get("cluster_violations", [])
+                if cv:
+                    for v in cv:
+                        severity_color = "#e94560" if v["severity"] == "HIGH" else "#ff9800"
+                        box_class = "alert-box" if v["severity"] == "HIGH" else "warning-box"
+                        st.markdown(
+                            f'<div class="{box_class}">'
+                            f'<strong>{v["cluster_name"]}</strong> '
+                            f'<span style="color:{severity_color}">'
+                            f'[{v["severity"]}]</span><br>'
+                            f'{v["violation_type"]}: {v["details"]}<br>'
+                            f'<em>Owner: {v["owner"]} | '
+                            f'Action: {v["recommended_action"]}</em></div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="success-box">'
+                        '✅ All clusters comply with policies</div>',
+                        unsafe_allow_html=True)
+
+            # ---- Tag Compliance ----
+            with gc_right:
+                st.subheader("🏷️ Tag Compliance")
+                tv = report.get("tag_violations", [])
+                if tv:
+                    for v in tv:
+                        missing_str = ", ".join(v.get("missing_tags", []))
+                        existing_str = ", ".join(v.get("existing_tags", [])[:5])
+                        st.markdown(
+                            f'<div class="warning-box">'
+                            f'<strong>{v["resource_name"]}</strong><br>'
+                            f'Missing tags: <code>{missing_str}</code><br>'
+                            f'<em>Owner: {v["owner"]} | '
+                            f'Existing: {existing_str}'
+                            f'</em></div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="success-box">'
+                        '✅ All clusters have required tags</div>',
+                        unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ---- Idle Resources & App Lifecycle ----
+            idle_left, idle_right = st.columns(2)
+            with idle_left:
+                st.subheader("💤 Idle Resources")
+                ia = report.get("idle_actions", [])
+                if ia:
+                    for a in ia:
+                        status_icon = "✅" if a.get("status") == "executed" else "🔍"
+                        st.markdown(
+                            f'<div class="warning-box">'
+                            f'{status_icon} <strong>{a.get("resource_name", "Unknown")}</strong> '
+                            f'({a.get("resource_type", "")})<br>'
+                            f'Idle: {a.get("idle_minutes", "N/A")} min | '
+                            f'Action: {a.get("action", "")} | '
+                            f'Status: {a.get("status", "")}<br>'
+                            f'<em>Owner: {a.get("owner", "unknown")}</em></div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="success-box">'
+                        '✅ No idle resources detected</div>',
+                        unsafe_allow_html=True)
+
+            with idle_right:
+                st.subheader("📱 App Lifecycle")
+                aa = report.get("app_actions", [])
+                if aa:
+                    for a in aa:
+                        status_icon = "✅" if a.get("status") == "executed" else "🔍"
+                        st.markdown(
+                            f'<div class="warning-box">'
+                            f'{status_icon} <strong>{a.get("app_name", "Unknown")}</strong><br>'
+                            f'State: {a.get("compute_state", "")} | '
+                            f'Action: {a.get("action", "")} | '
+                            f'Status: {a.get("status", "")}<br>'
+                            f'<em>{a.get("reason", "")}</em></div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div class="success-box">'
+                        '✅ No idle apps running</div>',
+                        unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ---- Runaway Jobs ----
+            st.subheader("🚀 Job Guardrails")
+            ja = report.get("job_actions", [])
+            if ja:
+                for a in ja:
+                    status_icon = "✅" if a.get("status") == "executed" else "⚠️"
+                    st.markdown(
+                        f'<div class="alert-box">'
+                        f'{status_icon} <strong>{a.get("job_name", "Unknown")}</strong> '
+                        f'(run {a.get("run_id", "")})<br>'
+                        f'Duration: {a.get("duration_min", 0):.0f} min | '
+                        f'{a.get("violation", "")}<br>'
+                        f'Action: {a.get("action", "")} | '
+                        f'Status: {a.get("status", "")}</div>',
+                        unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div class="success-box">'
+                    '✅ No runaway jobs detected</div>',
+                    unsafe_allow_html=True)
+
+            # ---- Audit Log ----
+            st.markdown("---")
+            with st.expander("📋 Audit Log", expanded=False):
+                audit_df = report.get("_audit_df")
+                if audit_df is not None and not audit_df.empty:
+                    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+                    csv = audit_df.to_csv(index=False)
+                    st.download_button("📥 Export Audit Log", csv,
+                                       "guardrail_audit.csv", "text/csv",
+                                       key="gr_audit_export")
+                else:
+                    st.info("No audit entries yet. Run a scan first.")
+
+    st.markdown("---")
+
+    # ================================================================
+    # LEGACY REMEDIATION SCANS (preserved from original)
+    # ================================================================
+    if REMEDIATION_MODULE_AVAILABLE:
+        st.subheader("🔧 Resource Scans (Legacy)")
+        st.caption("Original scan capabilities from the remediation engine")
+
         if "remediation_audit_log" not in st.session_state:
             st.session_state["remediation_audit_log"] = []
 
-        # ---- Policy Configuration ----
-        st.subheader("⚙️ Remediation Policies")
-        pol_col1, pol_col2, pol_col3, pol_col4 = st.columns(4)
+        pol_col1, pol_col2, pol_col3 = st.columns(3)
         with pol_col1:
-            confidence_threshold = st.slider(
-                "Anomaly Confidence Threshold",
-                min_value=0.5, max_value=1.0, value=0.9, step=0.05,
-                help="Only take action on anomalies with score >= this threshold"
-            )
-        with pol_col2:
             idle_cpu_threshold = st.slider(
                 "Idle Cluster CPU %",
                 min_value=5, max_value=30, value=15,
-                help="Clusters with avg CPU below this are candidates for termination"
+                help="Clusters with avg CPU below this are candidates for termination",
+                key="legacy_cpu_thresh"
             )
-        with pol_col3:
+        with pol_col2:
             max_daily_job_cost = st.number_input(
                 "Max Daily Job Cost ($)",
                 min_value=0, value=500, step=50,
-                help="Flag jobs exceeding this daily cost"
+                help="Flag jobs exceeding this daily cost",
+                key="legacy_job_cost"
             )
-        with pol_col4:
-            dry_run_mode = st.toggle(
-                "🛡️ Dry Run Mode",
+        with pol_col3:
+            legacy_dry_run = st.toggle(
+                "🛡️ Legacy Dry Run",
                 value=True,
-                help="When ON, actions are simulated but not executed"
+                help="When ON, actions are simulated",
+                key="legacy_dry_run"
             )
 
-        if dry_run_mode:
-            st.info("🛡️ **Dry Run Mode is ON** — All actions will be simulated. No changes will be made.")
-        else:
-            st.warning("⚠️ **LIVE MODE** — Actions will be executed! Use with caution.")
+        remediation_engine = RemediationEngine(conn, dry_run=legacy_dry_run)
 
-        # Initialize RemediationEngine
-        remediation_engine = RemediationEngine(conn, dry_run=dry_run_mode)
+        scan_c1, scan_c2, scan_c3 = st.columns(3)
 
-        st.markdown("---")
-
-        # ---- Three-column scan results ----
-        st.subheader("🔍 Resource Scans")
-        scan_col1, scan_col2, scan_col3 = st.columns(3)
-
-        # ---- Idle Clusters ----
-        with scan_col1:
+        with scan_c1:
             st.markdown("##### 💤 Idle Clusters")
-            if st.button("🔄 Scan Idle Clusters", key="scan_idle"):
-                with st.spinner("Scanning for idle clusters..."):
+            if st.button("🔄 Scan Idle Clusters", key="legacy_scan_idle"):
+                with st.spinner("Scanning..."):
                     idle_clusters = remediation_engine.scan_idle_clusters(
                         cpu_threshold=idle_cpu_threshold,
                         start_date=str(start_date),
                         end_date=str(end_date)
                     )
                     st.session_state["idle_clusters"] = idle_clusters
-
             if "idle_clusters" in st.session_state:
                 clusters = st.session_state["idle_clusters"]
                 if clusters:
                     st.metric("Found", len(clusters))
                     for i, c in enumerate(clusters[:5]):
-                        with st.container():
-                            st.markdown(
-                                f'<div class="warning-box">'
-                                f'<strong>{c["cluster_name"]}</strong><br>'
-                                f'CPU: {c["cpu_avg"]}% | Workers: {c["workers"]}<br>'
-                                f'Est. Waste: ${c["estimated_waste_cost"]:,.0f}<br>'
-                                f'<em>{c["reason"]}</em></div>',
-                                unsafe_allow_html=True)
-                            if c["recommended_action"] != "monitor":
-                                if st.button(
-                                    f"{'[DRY] ' if dry_run_mode else ''}"
-                                    f"{c['recommended_action'].replace('_', ' ').title()}",
-                                    key=f"cluster_action_{i}"
-                                ):
-                                    result = remediation_engine.execute_action(
-                                        c["recommended_action"], c["cluster_id"]
-                                    )
-                                    st.session_state["remediation_audit_log"].append({
-                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "action": c["recommended_action"],
-                                        "resource": c["cluster_name"],
-                                        "resource_id": c["cluster_id"],
-                                        "status": result["status"],
-                                        "message": result["message"],
-                                        "dry_run": dry_run_mode,
-                                    })
-                                    st.toast(result["message"])
+                        st.markdown(
+                            f'<div class="warning-box">'
+                            f'<strong>{c["cluster_name"]}</strong><br>'
+                            f'CPU: {c["cpu_avg"]}% | Workers: {c["workers"]}'
+                            f'<br>Est. Waste: ${c["estimated_waste_cost"]:,.0f}'
+                            f'</div>',
+                            unsafe_allow_html=True)
                 else:
                     st.success("No idle clusters found.")
 
-        # ---- Runaway Jobs ----
-        with scan_col2:
+        with scan_c2:
             st.markdown("##### 🚀 Runaway Jobs")
-            if st.button("🔄 Scan Runaway Jobs", key="scan_jobs"):
-                with st.spinner("Scanning for runaway jobs..."):
-                    runaway_jobs = remediation_engine.scan_runaway_jobs(
+            if st.button("🔄 Scan Runaway Jobs", key="legacy_scan_jobs"):
+                with st.spinner("Scanning..."):
+                    runaway = remediation_engine.scan_runaway_jobs(
                         cost_threshold_daily=max_daily_job_cost if max_daily_job_cost > 0 else None,
                         start_date=str(start_date),
                         end_date=str(end_date)
                     )
-                    st.session_state["runaway_jobs"] = runaway_jobs
-
+                    st.session_state["runaway_jobs"] = runaway
             if "runaway_jobs" in st.session_state:
                 jobs = st.session_state["runaway_jobs"]
                 if jobs:
                     st.metric("Found", len(jobs))
                     for i, j in enumerate(jobs[:5]):
-                        with st.container():
-                            st.markdown(
-                                f'<div class="alert-box">'
-                                f'<strong>{j["job_name"]}</strong><br>'
-                                f'Cost: ${j["daily_cost"]:,.0f} | Duration: {j["duration_min"]}min<br>'
-                                f'State: {j["result_state"]}<br>'
-                                f'<em>{j["issues"]}</em></div>',
-                                unsafe_allow_html=True)
-                            if j["result_state"] == "FAILED" or j["recommended_action"] == "stop_job_run":
-                                if st.button(
-                                    f"{'[DRY] ' if dry_run_mode else ''}"
-                                    f"Stop Run {j['run_id']}",
-                                    key=f"job_action_{i}"
-                                ):
-                                    result = remediation_engine.execute_action(
-                                        "stop_job_run", j["run_id"]
-                                    )
-                                    st.session_state["remediation_audit_log"].append({
-                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "action": "stop_job_run",
-                                        "resource": j["job_name"],
-                                        "resource_id": j["run_id"],
-                                        "status": result["status"],
-                                        "message": result["message"],
-                                        "dry_run": dry_run_mode,
-                                    })
-                                    st.toast(result["message"])
+                        st.markdown(
+                            f'<div class="alert-box">'
+                            f'<strong>{j["job_name"]}</strong><br>'
+                            f'Cost: ${j["daily_cost"]:,.0f} | '
+                            f'{j["duration_min"]}min</div>',
+                            unsafe_allow_html=True)
                 else:
                     st.success("No runaway jobs found.")
 
-        # ---- Oversized Warehouses ----
-        with scan_col3:
-            st.markdown("##### 🏭 SQL Warehouses")
-            if st.button("🔄 Scan Warehouses", key="scan_wh"):
-                with st.spinner("Scanning warehouses..."):
-                    warehouses = remediation_engine.scan_oversized_warehouses(
+        with scan_c3:
+            st.markdown("##### 📦 Oversized Warehouses")
+            if st.button("🔄 Scan Warehouses", key="legacy_scan_wh"):
+                with st.spinner("Scanning..."):
+                    oversized = remediation_engine.scan_oversized_warehouses(
                         start_date=str(start_date),
                         end_date=str(end_date)
                     )
-                    st.session_state["oversized_warehouses"] = warehouses
-
+                    st.session_state["oversized_warehouses"] = oversized
             if "oversized_warehouses" in st.session_state:
                 whs = st.session_state["oversized_warehouses"]
                 if whs:
                     st.metric("Found", len(whs))
-                    for i, w in enumerate(whs[:5]):
-                        with st.container():
-                            st.markdown(
-                                f'<div class="recommend-box">'
-                                f'<strong>{w["warehouse_id"]}</strong><br>'
-                                f'Cost: ${w["total_cost"]:,.0f} | DBUs: {w["total_dbus"]:,.0f}<br>'
-                                f'Days Active: {w["active_days"]}<br>'
-                                f'<em>{w["reason"]}</em></div>',
-                                unsafe_allow_html=True)
+                    for w in whs[:5]:
+                        st.markdown(
+                            f'<div class="warning-box">'
+                            f'<strong>{w["warehouse_id"]}</strong><br>'
+                            f'Cost: ${w["total_cost"]:,.0f} | '
+                            f'{w["total_dbus"]:,.0f} DBUs</div>',
+                            unsafe_allow_html=True)
                 else:
-                    st.success("No warehouse issues found.")
+                    st.success("No oversized warehouses found.")
 
-        # ---- Anomaly-Based Remediation ----
+    # --- PDF Download for Guardrails & Remediation tab ---
+    if PDF_EXPORT_AVAILABLE:
         st.markdown("---")
-        st.subheader("🎯 Anomaly-Based Remediation Plan")
-        if "df_anomalies" in st.session_state and not st.session_state["df_anomalies"].empty:
-            remediation_plan = remediation_engine.get_remediation_plan(
-                st.session_state["df_anomalies"],
-                confidence_threshold=confidence_threshold
-            )
-            if remediation_plan:
-                st.info(f"Found {len(remediation_plan)} actionable anomalies (score >= {confidence_threshold})")
-                plan_df = pd.DataFrame(remediation_plan)
-                st.dataframe(
-                    plan_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "daily_cost": st.column_config.NumberColumn("Daily Cost", format="$%.0f"),
-                        "expected_cost": st.column_config.NumberColumn("Expected", format="$%.0f"),
-                        "excess_cost": st.column_config.NumberColumn("Excess", format="$%.0f"),
-                        "anomaly_score": st.column_config.NumberColumn("Score", format="%.2f"),
-                    }
+        if st.button("📄 Download Tab as PDF", key="pdf_remediation"):
+            with st.spinner("Generating PDF..."):
+                gr_text = []
+                gr_dfs = []
+                try:
+                    report = st.session_state.get("guardrail_report")
+                    if report:
+                        s = report["summary"]
+                        gr_text.append(("Guardrail Summary",
+                            f"Total Violations: {s['total_violations']} | "
+                            f"Critical: {s['critical_count']} | "
+                            f"Compliance Score: {s['compliance_score']}% | "
+                            f"Est. Daily Savings: ${s['estimated_daily_savings']:,.0f}"))
+                        audit_df = report.get("_audit_df")
+                        if audit_df is not None and not audit_df.empty:
+                            gr_dfs.append((audit_df.head(30), "Audit Log", 30))
+                except Exception:
+                    pass
+                if not gr_text:
+                    gr_text.append(("Status", "Run a guardrail scan to populate this report."))
+                pdf_bytes = generate_tab_pdf(
+                    tab_title="Guardrails & Remediation Engine",
+                    date_range=f"{start_date} to {end_date}",
+                    text_sections=gr_text,
+                    dataframes=gr_dfs if gr_dfs else None,
                 )
-
-                # AI explanation for top action
-                if st.button("🧠 Get AI Explanation for Top Action", key="ai_explain"):
-                    top_action = remediation_plan[0]
-                    explain_query = remediation_engine.get_ai_explanation_query(top_action)
-                    with st.spinner("AI generating explanation..."):
-                        try:
-                            explain_result = run_query_nocache(conn, explain_query)
-                            st.markdown(
-                                f'<div class="ai-box">🧠 <strong>AI Recommendation</strong><br><br>'
-                                f'{explain_result.iloc[0]["explanation"]}</div>',
-                                unsafe_allow_html=True)
-                        except Exception as e:
-                            st.error(f"AI explanation failed: {e}")
-            else:
-                st.success("No anomalies meet the confidence threshold for remediation.")
-        else:
-            st.info("👈 Run anomaly detection in the **Budget & Anomaly** tab first to generate a remediation plan.")
-
-        # ---- Audit Log ----
-        st.markdown("---")
-        st.subheader("📝 Remediation Audit Log")
-        if st.session_state["remediation_audit_log"]:
-            audit_df = pd.DataFrame(st.session_state["remediation_audit_log"])
-            st.dataframe(audit_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "📥 Export Audit Log",
-                audit_df.to_csv(index=False),
-                "remediation_audit_log.csv", "text/csv"
-            )
-            if st.button("🗑️ Clear Audit Log", key="clear_audit"):
-                st.session_state["remediation_audit_log"] = []
-                st.rerun()
-        else:
-            st.info("No remediation actions have been taken yet.")
+                st.download_button(
+                    "⬇️ Download PDF", pdf_bytes,
+                    file_name="finops_guardrails_remediation.pdf",
+                    mime="application/pdf", key="pdf_remediation_dl"
+                )
 
 
 # ===========================================================================
-# TAB 7 — AI FINOPS AGENT (Conversational Chat)
+# TAB 7 — RESOURCE CLEANUP ACTION PLAN
+# ===========================================================================
+with tab_action:
+    st.header("📋 Resource Cleanup Action Plan")
+    st.caption("Identifies actively burning resources with DELETE/STOP/TERMINATE recommendations")
+
+    if not ACTION_PLAN_MODULE_AVAILABLE:
+        st.warning("⚠️ Action Plan module not available. Ensure `finops_action_plan.py` is in the app directory.")
+    else:
+        try:
+            planner = ActionPlanGenerator(conn, subscription_filter=selected_subscriptions or "STAR Group Sandbox", lookback_days=7)
+
+            with st.spinner("Generating action plan..."):
+                plan = planner.generate_action_plan(min_spend_threshold=1.0)
+
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                metric_card("Total Monthly Savings", f"${plan['total_monthly_savings']:,.0f}", prefix="")
+            with col2:
+                metric_card("Critical Resources", plan['summary']['by_priority'].get('CRITICAL', 0))
+            with col3:
+                metric_card("High Priority", plan['summary']['by_priority'].get('HIGH', 0))
+            with col4:
+                metric_card("Total Resources", plan['summary']['total_resources'])
+
+            st.markdown("---")
+
+            # Action plan DataFrame
+            df_plan = planner.as_dataframe(plan)
+            if not df_plan.empty:
+                st.subheader("🔥 Resources to Action")
+
+                # Priority filter
+                priorities = st.multiselect(
+                    "Filter by Priority",
+                    options=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                    default=["CRITICAL", "HIGH"],
+                    key="action_plan_priority_filter"
+                )
+                if priorities:
+                    df_display = df_plan[df_plan["priority"].isin(priorities)]
+                else:
+                    df_display = df_plan
+
+                st.dataframe(
+                    df_display.style.apply(
+                        lambda row: [
+                            'background-color: #3d1f1f' if row['priority'] == 'CRITICAL'
+                            else 'background-color: #3d2e1f' if row['priority'] == 'HIGH'
+                            else 'background-color: #1f2d3d' if row['priority'] == 'MEDIUM'
+                            else '' for _ in row
+                        ], axis=1
+                    ),
+                    use_container_width=True,
+                    height=400,
+                )
+
+                # Cost by product chart
+                st.subheader("💰 Projected Monthly Cost by Product")
+                cost_by_product = df_plan.groupby("product")["projected_monthly_cost"].sum().reset_index()
+                cost_by_product = cost_by_product.sort_values("projected_monthly_cost", ascending=False)
+                fig = px.bar(
+                    cost_by_product, x="product", y="projected_monthly_cost",
+                    color="projected_monthly_cost",
+                    color_continuous_scale="Reds",
+                    labels={"product": "Resource Type", "projected_monthly_cost": "Projected Monthly ($)"}
+                )
+                fig.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20))
+                st.plotly_chart(fig, use_container_width=True)
+
+                # AI Summary
+                st.subheader("🤖 AI Executive Summary")
+                if st.button("Generate AI Summary", key="gen_ai_summary"):
+                    with st.spinner("Generating AI summary..."):
+                        summary = planner.generate_ai_summary(plan)
+                    st.markdown(f'<div class="ai-box">{summary}</div>', unsafe_allow_html=True)
+
+                # Export
+                st.subheader("📤 Export")
+                col_md, col_csv = st.columns(2)
+                with col_md:
+                    md_output = planner.format_as_markdown(plan)
+                    st.download_button("📝 Download Markdown", md_output, "action_plan.md", "text/markdown")
+                with col_csv:
+                    csv_output = df_plan.to_csv(index=False)
+                    st.download_button("📊 Download CSV", csv_output, "action_plan.csv", "text/csv")
+            else:
+                st.success("✅ No resources exceeding spend thresholds found!")
+        except Exception as e:
+            st.error(f"Error generating action plan: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+    # --- PDF Download for Action Plan tab ---
+    if PDF_EXPORT_AVAILABLE:
+        st.markdown("---")
+        if st.button("📄 Download Tab as PDF", key="pdf_action"):
+            with st.spinner("Generating PDF..."):
+                action_dfs = []
+                action_text = []
+                try:
+                    if 'plan' in dir() and plan is not None:
+                        action_text.append(("Total Monthly Savings", f"${plan.get('total_monthly_savings', 0):,.0f}"))
+                        if plan.get('actions'):
+                            action_df = pd.DataFrame(plan['actions'])
+                            action_dfs.append((action_df.head(50), "Action Items", 50))
+                except Exception:
+                    action_text.append(("Status", "Action plan data not available. Run the analysis first."))
+                pdf_bytes = generate_tab_pdf(
+                    tab_title="Resource Cleanup Action Plan",
+                    date_range=f"{start_date} to {end_date}",
+                    text_sections=action_text if action_text else None,
+                    dataframes=action_dfs if action_dfs else None,
+                )
+                st.download_button(
+                    "⬇️ Download PDF", pdf_bytes,
+                    file_name="finops_action_plan.pdf",
+                    mime="application/pdf", key="pdf_action_dl"
+                )
+
+
 # ===========================================================================
 with tab_agent:
     st.header("🤖 AI FinOps Agent")

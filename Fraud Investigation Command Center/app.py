@@ -529,7 +529,7 @@ def load_data():
             
         w = WorkspaceClient()
         response = w.statement_execution.execute_statement(
-            statement="SELECT * FROM salama_insurance.salama_silver.fact_fraud_investigation LIMIT 50000",
+            statement="SELECT * FROM uae_insurance.uae_silver.fact_fraud_investigation LIMIT 50000",
             warehouse_id=WAREHOUSE_ID,
             wait_timeout="40s"
         )
@@ -855,7 +855,7 @@ Generate ONLY a valid SQL SELECT query. Do NOT include any explanation or markdo
 
 Available tables and their columns:
 
-1. salama_insurance.salama_silver.fact_fraud_investigation (fi)
+1. uae_insurance.uae_silver.fact_fraud_investigation (fi)
    - INVESTIGATION_ID (string), CLAIM_KEY (decimal), FRAUD_SCORE (double): 0-100
    - INVESTIGATION_COST (double), FRAUD_AMOUNT_DETECTED (double), RECOVERY_AMOUNT (double)
    - INVESTIGATION_DAYS (decimal), FRAUD_DETECTION_RATE (decimal)
@@ -863,7 +863,7 @@ Available tables and their columns:
    - FINDINGS (string): FRAUD_CONFIRMED/FRAUD_SUSPECTED/INCONCLUSIVE/NO_FRAUD
    - FR_DATE (timestamp), MONTHYEAR (string), MONTHYEAR_SORT (decimal)
 
-2. salama_insurance.salama_silver.fact_claim (fc)
+2. uae_insurance.uae_silver.fact_claim (fc)
    - CLAIM_ID (string), POLICY_ID (string), CUSTOMER_KEY (decimal)
    - CLAIM_KEY (decimal): JOIN to fi.CLAIM_KEY
    - CLAIMED_AMOUNT (double), APPROVED_AMOUNT (double), PAID_AMOUNT (double), RESERVE_AMOUNT (double)
@@ -873,19 +873,19 @@ Available tables and their columns:
    - ADJUSTER_ID (string), RISK_RATING (string), RISK_SCORE (decimal)
    - CLAIM_AGING_BUCKET (string), CL_DATE (timestamp)
 
-3. salama_insurance.salama_silver.dim_customer (dc)
+3. uae_insurance.uae_silver.dim_customer (dc)
    - CUSTOMER_KEY (decimal): JOIN to fc.CUSTOMER_KEY
    - CUSTOMER_ID (string), CUSTOMER_TYPE (string), CUSTOMER_NAME (string)
    - NATIONALITY (string), EMIRATES (string), CITY (string)
    - RISK_RATING (string), CUSTOMER_SEGMENT (string), IS_ACTIVE (boolean)
 
-4. salama_insurance.salama_silver.dim_policy (dp)
+4. uae_insurance.uae_silver.dim_policy (dp)
    - POLICY_KEY (decimal), POLICY_ID (string), POLICY_NUMBER (string)
    - PRODUCT_CODE (string), BUSINESS_LINE (string)
    - PREMIUM_AMOUNT (double), SUM_INSURED (double)
    - POLICY_STATUS (string), SALES_CHANNEL (string)
 
-5. salama_insurance.salama_silver.fraud_ai_results (ai)
+5. uae_insurance.uae_silver.fraud_ai_results (ai)
    - INVESTIGATION_ID (string): Links to fi.INVESTIGATION_ID
    - AI_INSIGHTS (string), AI_PRIORITY (string), AI_RECOMMENDATIONS (string)
 
@@ -1113,14 +1113,107 @@ st.markdown("<div style='height: 16px'></div>", unsafe_allow_html=True)
 # --- PAGE: Investigation Pipeline ---
 if page == "\U0001F50D  Investigation Pipeline":
     if not df.empty:
-        c1, c2 = st.columns(2, gap="large")
-        with c1:
+        st.markdown("""<div class="section-header">
+            <span class="section-header-icon">\U0001F50D</span>
+            <span class="section-header-text">Investigation Pipeline Command Center</span>
+        </div>""", unsafe_allow_html=True)
+        st.caption("Operational command center for fraud case management. Claims flagged by ML risk scoring are automatically ingested and prioritized.")
+
+        # ============================================================
+        # PRIORITY TIER CLASSIFICATION
+        # ============================================================
+        # AI priority score = fraud_score * 0.6 + normalized_exposure * 0.4
+        pipeline_df = df.copy()
+        max_exposure = pipeline_df['FRAUD_AMOUNT_DETECTED'].max() if pipeline_df['FRAUD_AMOUNT_DETECTED'].max() > 0 else 1
+        pipeline_df['normalized_exposure'] = (pipeline_df['FRAUD_AMOUNT_DETECTED'] / max_exposure * 100)
+        pipeline_df['priority_score'] = (pipeline_df['FRAUD_SCORE'] * 0.6 + pipeline_df['normalized_exposure'] * 0.4).round(1)
+        pipeline_df['priority_tier'] = pipeline_df['priority_score'].apply(
+            lambda s: 'CRITICAL' if s >= 80 else ('HIGH' if s >= 60 else ('MEDIUM' if s >= 40 else 'LOW'))
+        )
+
+        # Priority Tier KPIs
+        tier_counts = pipeline_df['priority_tier'].value_counts()
+        active_cases = pipeline_df[pipeline_df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS'])].shape[0]
+        avg_resolution = pipeline_df[pipeline_df['INVESTIGATION_STATUS'] == 'COMPLETED']['INVESTIGATION_DAYS'].mean()
+        sla_breach = pipeline_df[(pipeline_df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS'])) & (pipeline_df['INVESTIGATION_DAYS'] > 30)].shape[0]
+
+        pk1, pk2, pk3, pk4, pk5, pk6 = st.columns(6, gap="small")
+        pk1.metric("\U0001F534 CRITICAL", tier_counts.get('CRITICAL', 0), help="Score \u2265 80")
+        pk2.metric("\U0001F7E0 HIGH", tier_counts.get('HIGH', 0), help="Score 60-79")
+        pk3.metric("\U0001F7E1 MEDIUM", tier_counts.get('MEDIUM', 0), help="Score 40-59")
+        pk4.metric("\U0001F7E2 LOW", tier_counts.get('LOW', 0), help="Score < 40")
+        pk5.metric("Active Pipeline", f"{active_cases:,}", help="INITIATED + IN_PROGRESS")
+        pk6.metric("SLA Breaches", sla_breach, delta=">30 days", delta_color="inverse")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 1: PIPELINE FLOW & STATUS
+        # ============================================================
+        st.subheader("\U0001F504 Pipeline Flow & Status Tracking")
+
+        pf1, pf2 = st.columns([3, 2], gap="large")
+        with pf1:
+            # Status breakdown with tier overlay
+            status_tier = pipeline_df.groupby(['INVESTIGATION_STATUS', 'priority_tier']).agg(
+                cases=('INVESTIGATION_ID', 'count')
+            ).reset_index()
+            order = ['INITIATED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED']
+            tier_order = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+
+            flow_chart = alt.Chart(status_tier).mark_bar(cornerRadiusEnd=4).encode(
+                x=alt.X('INVESTIGATION_STATUS:N', sort=order, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y('cases:Q', title='Cases', stack='zero'),
+                color=alt.Color('priority_tier:N', sort=tier_order, scale=alt.Scale(
+                    domain=tier_order, range=['#dc2626', '#f59e0b', '#eab308', '#10b981']
+                ), title='Priority Tier'),
+                tooltip=['INVESTIGATION_STATUS', 'priority_tier', alt.Tooltip('cases:Q', title='Cases')]
+            ).properties(height=320, title='Pipeline Stages by Priority Tier')
+            st.altair_chart(flow_chart, use_container_width=True)
+
+        with pf2:
+            # Funnel metrics
+            status_counts = pipeline_df['INVESTIGATION_STATUS'].value_counts()
+            funnel_data = pd.DataFrame({
+                'Stage': order,
+                'Count': [status_counts.get(s, 0) for s in order]
+            })
+            funnel_data['Pct'] = (funnel_data['Count'] / funnel_data['Count'].sum() * 100).round(1)
+
+            st.markdown("**Pipeline Funnel**")
+            for _, row in funnel_data.iterrows():
+                bar_width = int(row['Pct'] * 2.5)
+                color = {'INITIATED': '#6366f1', 'IN_PROGRESS': '#f59e0b', 'COMPLETED': '#10b981', 'CLOSED': '#64748b'}.get(row['Stage'], '#888')
+                st.markdown(f"""
+                <div style="margin-bottom:8px;">
+                    <div style="font-size:0.8rem;color:#94a3b8;">{row['Stage']}</div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <div style="height:24px;width:{max(bar_width, 8)}%;background:{color};border-radius:4px;min-width:30px;"></div>
+                        <span style="font-weight:600;">{int(row['Count'])} ({row['Pct']}%)</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Transition rates
+            initiated = status_counts.get('INITIATED', 0)
+            in_progress = status_counts.get('IN_PROGRESS', 0)
+            completed = status_counts.get('COMPLETED', 0)
+            closed = status_counts.get('CLOSED', 0)
+            st.markdown("**Transition Rates**")
+            if initiated > 0:
+                st.markdown(f"INITIATED \u2192 IN_PROGRESS: **{in_progress/(initiated+in_progress)*100:.0f}%**" if (initiated+in_progress) > 0 else "")
+            if (in_progress + completed) > 0:
+                st.markdown(f"IN_PROGRESS \u2192 COMPLETED: **{completed/(in_progress+completed)*100:.0f}%**")
+
+        # Original charts (enhanced)
+        st.markdown("---")
+        oc1, oc2 = st.columns(2, gap="large")
+        with oc1:
             st.markdown("""<div class="section-header">
                 <span class="section-header-icon">\U0001F4CA</span>
                 <span class="section-header-text">By Status</span>
             </div>""", unsafe_allow_html=True)
             status_df = df.groupby('INVESTIGATION_STATUS').agg(Count=('INVESTIGATION_ID', 'count'), Avg_Score=('FRAUD_SCORE', 'mean'), Total_Cost=('INVESTIGATION_COST', 'sum')).reset_index()
-            order = ['INITIATED', 'IN_PROGRESS', 'COMPLETED', 'CLOSED']
             status_df['INVESTIGATION_STATUS'] = pd.Categorical(status_df['INVESTIGATION_STATUS'], categories=order, ordered=True)
             status_df = status_df.sort_values('INVESTIGATION_STATUS')
             chart = alt.Chart(status_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6, opacity=0.9).encode(
@@ -1128,10 +1221,10 @@ if page == "\U0001F50D  Investigation Pipeline":
                 y=alt.Y('Count:Q', title='Investigations'),
                 color=alt.Color('INVESTIGATION_STATUS:N', scale=alt.Scale(domain=order, range=['#6366f1', '#f59e0b', '#10b981', '#64748b']), legend=None),
                 tooltip=[alt.Tooltip('INVESTIGATION_STATUS:N', title='Status'), alt.Tooltip('Count:Q', title='Cases'), alt.Tooltip('Avg_Score:Q', format='.1f', title='Avg Score'), alt.Tooltip('Total_Cost:Q', format=',.0f', title='Total Cost (AED)')]
-            ).properties(height=360)
+            ).properties(height=320)
             st.altair_chart(chart, use_container_width=True)
 
-        with c2:
+        with oc2:
             st.markdown("""<div class="section-header">
                 <span class="section-header-icon">\U0001F3AF</span>
                 <span class="section-header-text">By Findings</span>
@@ -1141,9 +1234,195 @@ if page == "\U0001F50D  Investigation Pipeline":
                 theta=alt.Theta('Count:Q'),
                 color=alt.Color('FINDINGS:N', scale=alt.Scale(domain=['FRAUD_CONFIRMED', 'FRAUD_SUSPECTED', 'INCONCLUSIVE', 'NO_FRAUD'], range=['#f43f5e', '#f59e0b', '#00C2A8', '#6366f1'])),
                 tooltip=[alt.Tooltip('FINDINGS:N', title='Finding'), alt.Tooltip('Count:Q', title='Cases'), alt.Tooltip('Avg_Score:Q', format='.1f', title='Avg Score'), alt.Tooltip('Total_Detected:Q', format=',.0f', title='Fraud Detected (AED)')]
-            ).properties(height=360)
+            ).properties(height=320)
             st.altair_chart(chart2, use_container_width=True)
 
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 2: AI-RANKED CASE QUEUE
+        # ============================================================
+        st.subheader("\U0001F916 AI-Ranked Case Assignment Queue")
+        st.caption("Cases ranked by composite priority score (60% fraud probability + 40% financial exposure). Auto-assigned to investigators based on capacity and specialization.")
+
+        # Active queue - only INITIATED and IN_PROGRESS
+        active_queue = pipeline_df[pipeline_df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS'])].copy()
+        active_queue = active_queue.sort_values('priority_score', ascending=False)
+
+        if not active_queue.empty:
+            aq1, aq2 = st.columns([2, 1], gap="large")
+            with aq1:
+                # Priority score distribution
+                score_hist = alt.Chart(active_queue).mark_bar(cornerRadiusEnd=3, opacity=0.8).encode(
+                    x=alt.X('priority_score:Q', bin=alt.Bin(maxbins=20), title='Priority Score'),
+                    y=alt.Y('count():Q', title='Cases'),
+                    color=alt.Color('priority_tier:N', sort=tier_order, scale=alt.Scale(
+                        domain=tier_order, range=['#dc2626', '#f59e0b', '#eab308', '#10b981']
+                    ), title='Tier'),
+                    tooltip=['priority_tier:N', 'count():Q']
+                ).properties(height=250, title='Active Queue: Priority Score Distribution')
+                st.altair_chart(score_hist, use_container_width=True)
+
+            with aq2:
+                # Assignment concentration
+                inv_load = active_queue.groupby('INVESTIGATOR_ID').agg(
+                    assigned=('INVESTIGATION_ID', 'count'),
+                    avg_priority=('priority_score', 'mean'),
+                    critical_cases=('priority_tier', lambda x: (x == 'CRITICAL').sum())
+                ).reset_index().sort_values('assigned', ascending=False)
+
+                st.markdown("**Investigator Load (Active)**")
+                overloaded = inv_load[inv_load['assigned'] > inv_load['assigned'].quantile(0.75)]
+                if not overloaded.empty:
+                    st.warning(f"{len(overloaded)} investigator(s) above 75th percentile workload")
+                st.dataframe(
+                    inv_load.head(8).rename(columns={'INVESTIGATOR_ID': 'Investigator', 'assigned': 'Active Cases', 'avg_priority': 'Avg Priority', 'critical_cases': 'Critical'}),
+                    use_container_width=True, hide_index=True
+                )
+
+            # Top priority cases table
+            queue_display = active_queue.head(20)[['INVESTIGATION_ID', 'priority_score', 'priority_tier', 'FRAUD_SCORE',
+                                                   'FRAUD_AMOUNT_DETECTED', 'INVESTIGATION_STATUS', 'INVESTIGATION_DAYS',
+                                                   'INVESTIGATOR_ID']].copy()
+            queue_display.columns = ['Case ID', 'Priority Score', 'Tier', 'Fraud Score', 'Exposure (AED)', 'Status', 'Days Open', 'Assigned To']
+            enhanced_dataframe(queue_display, title="Top 20 Priority Cases", key_prefix="ai_queue", height=350)
+        else:
+            st.success("\u2705 No active cases in pipeline. All investigations resolved.")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 3: SLA MONITORING & AGING
+        # ============================================================
+        st.subheader("\u23F1\uFE0F SLA Monitoring & Case Aging")
+
+        sla1, sla2 = st.columns(2, gap="large")
+        with sla1:
+            # Aging distribution by priority tier
+            aging_data = pipeline_df[pipeline_df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS'])].copy()
+            if not aging_data.empty:
+                aging_data['aging_bucket'] = aging_data['INVESTIGATION_DAYS'].apply(
+                    lambda d: '0-7 days' if d <= 7 else ('8-14 days' if d <= 14 else ('15-30 days' if d <= 30 else ('31-60 days' if d <= 60 else '60+ days')))
+                )
+                bucket_order = ['0-7 days', '8-14 days', '15-30 days', '31-60 days', '60+ days']
+
+                aging_chart = alt.Chart(aging_data).mark_bar(cornerRadiusEnd=3).encode(
+                    x=alt.X('aging_bucket:N', sort=bucket_order, title=None, axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y('count():Q', title='Cases'),
+                    color=alt.Color('priority_tier:N', sort=tier_order, scale=alt.Scale(
+                        domain=tier_order, range=['#dc2626', '#f59e0b', '#eab308', '#10b981']
+                    ), title='Tier'),
+                    tooltip=['aging_bucket:N', 'priority_tier:N', 'count():Q']
+                ).properties(height=280, title='Case Aging Distribution (Active Pipeline)')
+                st.altair_chart(aging_chart, use_container_width=True)
+            else:
+                st.info("No active cases for aging analysis.")
+
+        with sla2:
+            # SLA compliance metrics
+            sla_thresholds = {'CRITICAL': 7, 'HIGH': 14, 'MEDIUM': 30, 'LOW': 60}
+            sla_results = []
+            for tier, threshold in sla_thresholds.items():
+                tier_active = pipeline_df[(pipeline_df['priority_tier'] == tier) & (pipeline_df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS']))]
+                total = len(tier_active)
+                breached = len(tier_active[tier_active['INVESTIGATION_DAYS'] > threshold])
+                compliance = ((total - breached) / total * 100) if total > 0 else 100
+                sla_results.append({'Tier': tier, 'SLA (days)': threshold, 'Active': total, 'Breached': breached, 'Compliance': compliance})
+
+            sla_df = pd.DataFrame(sla_results)
+            st.markdown("**SLA Compliance by Priority Tier**")
+            for _, row in sla_df.iterrows():
+                color = '#10b981' if row['Compliance'] >= 80 else ('#f59e0b' if row['Compliance'] >= 60 else '#ef4444')
+                icon = '\u2705' if row['Compliance'] >= 80 else ('\u26A0\uFE0F' if row['Compliance'] >= 60 else '\U0001F6A8')
+                st.markdown(f"""
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 12px;margin:4px 0;background:rgba(255,255,255,0.03);border-radius:6px;border-left:3px solid {color};">
+                    <span>{icon} <strong>{row['Tier']}</strong> (SLA: {int(row['SLA (days)'])}d)</span>
+                    <span style="color:{color};font-weight:700;">{row['Compliance']:.0f}%</span>
+                    <span style="font-size:0.8rem;color:#94a3b8;">{int(row['Breached'])}/{int(row['Active'])} breached</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Overall SLA alert
+            overall_compliance = sla_df['Compliance'].mean()
+            if overall_compliance < 70:
+                st.error(f"\U0001F6A8 Overall SLA compliance at {overall_compliance:.0f}% \u2014 immediate resource reallocation needed")
+            elif overall_compliance < 85:
+                st.warning(f"\u26A0\uFE0F SLA compliance at {overall_compliance:.0f}% \u2014 monitor CRITICAL/HIGH tier closely")
+            else:
+                st.success(f"\u2705 SLA compliance healthy at {overall_compliance:.0f}%")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 4: INVESTIGATOR WORKLOAD & AUDIT TRAIL
+        # ============================================================
+        st.subheader("\U0001F4CB Audit Trail & Workload Analysis")
+
+        at1, at2 = st.columns(2, gap="large")
+        with at1:
+            # Resolution time by priority tier (completed cases)
+            completed_cases = pipeline_df[pipeline_df['INVESTIGATION_STATUS'].isin(['COMPLETED', 'CLOSED'])].copy()
+            if not completed_cases.empty:
+                resolution_by_tier = completed_cases.groupby('priority_tier').agg(
+                    avg_days=('INVESTIGATION_DAYS', 'mean'),
+                    median_days=('INVESTIGATION_DAYS', 'median'),
+                    cases=('INVESTIGATION_ID', 'count')
+                ).reset_index()
+                resolution_by_tier['priority_tier'] = pd.Categorical(resolution_by_tier['priority_tier'], categories=tier_order, ordered=True)
+                resolution_by_tier = resolution_by_tier.sort_values('priority_tier')
+
+                res_chart = alt.Chart(resolution_by_tier).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X('priority_tier:N', sort=tier_order, title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('avg_days:Q', title='Avg Resolution Days'),
+                    color=alt.Color('priority_tier:N', sort=tier_order, scale=alt.Scale(
+                        domain=tier_order, range=['#dc2626', '#f59e0b', '#eab308', '#10b981']
+                    ), legend=None),
+                    tooltip=['priority_tier', alt.Tooltip('avg_days:Q', format='.1f', title='Avg Days'),
+                            alt.Tooltip('median_days:Q', format='.0f', title='Median Days'),
+                            alt.Tooltip('cases:Q', title='Resolved Cases')]
+                ).properties(height=280, title='Avg Resolution Time by Priority Tier')
+                st.altair_chart(res_chart, use_container_width=True)
+            else:
+                st.info("No completed cases for resolution analysis.")
+
+        with at2:
+            # Investigator efficiency scatter
+            inv_efficiency = pipeline_df.groupby('INVESTIGATOR_ID').agg(
+                total_cases=('INVESTIGATION_ID', 'count'),
+                avg_days=('INVESTIGATION_DAYS', 'mean'),
+                avg_priority=('priority_score', 'mean'),
+                confirmed=('FINDINGS', lambda x: (x == 'FRAUD_CONFIRMED').sum()),
+                total_recovered=('RECOVERY_AMOUNT', 'sum')
+            ).reset_index()
+            inv_efficiency['confirm_rate'] = (inv_efficiency['confirmed'] / inv_efficiency['total_cases'] * 100).round(1)
+
+            scatter = alt.Chart(inv_efficiency).mark_circle(opacity=0.7).encode(
+                x=alt.X('avg_days:Q', title='Avg Investigation Days', scale=alt.Scale(zero=False)),
+                y=alt.Y('confirm_rate:Q', title='Confirmation Rate (%)', scale=alt.Scale(zero=False)),
+                size=alt.Size('total_cases:Q', title='Caseload', scale=alt.Scale(range=[60, 400])),
+                color=alt.Color('avg_priority:Q', scale=alt.Scale(scheme='redyellowgreen', reverse=True), title='Avg Priority'),
+                tooltip=['INVESTIGATOR_ID', alt.Tooltip('total_cases:Q', title='Cases'),
+                        alt.Tooltip('avg_days:Q', format='.1f', title='Avg Days'),
+                        alt.Tooltip('confirm_rate:Q', format='.1f', title='Confirm %'),
+                        alt.Tooltip('total_recovered:Q', format=',.0f', title='Recovered (AED)')]
+            ).properties(height=280, title='Investigator Efficiency (Speed vs Accuracy)')
+            st.altair_chart(scatter, use_container_width=True)
+
+        # Detailed audit table
+        with st.expander("\U0001F4C4 Full Case Audit Trail", expanded=False):
+            audit_display = pipeline_df[['INVESTIGATION_ID', 'priority_score', 'priority_tier', 'FRAUD_SCORE',
+                                         'FRAUD_AMOUNT_DETECTED', 'RECOVERY_AMOUNT', 'INVESTIGATION_STATUS',
+                                         'FINDINGS', 'INVESTIGATION_DAYS', 'INVESTIGATOR_ID', 'MONTHYEAR']].copy()
+            audit_display = audit_display.sort_values('priority_score', ascending=False)
+            audit_display.columns = ['Case ID', 'Priority', 'Tier', 'Fraud Score', 'Exposure (AED)',
+                                     'Recovery (AED)', 'Status', 'Finding', 'Days', 'Investigator', 'Month']
+            st.dataframe(audit_display, use_container_width=True, hide_index=True, height=400)
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 5: HIGH RISK INVESTIGATIONS TABLE
+        # ============================================================
         st.markdown("""<div class="section-header">
             <span class="section-header-icon">\U000026A0\U0000FE0F</span>
             <span class="section-header-text">High Risk Investigations (Fraud Score > 75)</span>
@@ -1156,28 +1435,730 @@ elif page == "\U0001F4C8  Trend Analysis":
     if not df.empty:
         st.markdown("""<div class="section-header">
             <span class="section-header-icon">\U0001F4C8</span>
-            <span class="section-header-text">Monthly Fraud Trends</span>
+            <span class="section-header-text">Trend Analysis \u2014 Temporal & Categorical Analytics</span>
         </div>""", unsafe_allow_html=True)
+        st.caption("Identify emerging schemes, geographic concentrations, and claim-type anomalies before they escalate.")
+
         if 'MONTHYEAR' in df.columns:
-            monthly = df.groupby('MONTHYEAR').agg(Investigations=('INVESTIGATION_ID', 'count'), Avg_Fraud_Score=('FRAUD_SCORE', 'mean'), Fraud_Detected=('FRAUD_AMOUNT_DETECTED', 'sum'), Recovery=('RECOVERY_AMOUNT', 'sum'), Cost=('INVESTIGATION_COST', 'sum'), Sort=('MONTHYEAR_SORT', 'first')).reset_index().sort_values('Sort')
-            metric_choice = st.selectbox("Select Metric", ["Investigations", "Avg_Fraud_Score", "Fraud_Detected", "Recovery", "Cost"])
-            base = alt.Chart(monthly).encode(x=alt.X('MONTHYEAR:N', sort=alt.EncodingSortField(field='Sort'), title='Month', axis=alt.Axis(labelAngle=-45)), tooltip=['MONTHYEAR', alt.Tooltip(f'{metric_choice}:Q', format=',.1f')])
-            area = base.mark_area(line=True, opacity=0.15, color=alt.Gradient(gradient='linear', stops=[alt.GradientStop(color='#6366f1', offset=0), alt.GradientStop(color='transparent', offset=1)], x1=1, x2=1, y1=1, y2=0)).encode(y=alt.Y(f'{metric_choice}:Q', title=metric_choice.replace('_', ' ')))
-            line = base.mark_line(strokeWidth=2.5, color='#6366f1').encode(y=alt.Y(f'{metric_choice}:Q'))
-            points = base.mark_circle(size=50, color='#818cf8', opacity=1).encode(y=alt.Y(f'{metric_choice}:Q'))
-            trend_chart = (area + line + points).properties(height=420)
-            st.altair_chart(trend_chart, use_container_width=True)
+            # Ensure MONTHYEAR_SORT is numeric for proper sorting
+            df['MONTHYEAR_SORT'] = pd.to_numeric(df['MONTHYEAR_SORT'], errors='coerce').fillna(0).astype(int)
+
+            # === SECTION 1: Enhanced Time-Series with MoM% Change ===
+            st.markdown("""<div class="glass-card"><div class="section-header">
+                <span class="section-header-icon">\U0001F4C8</span>
+                <span class="section-header-text">Time-Series Trends with Month-over-Month Change</span>
+            </div>""", unsafe_allow_html=True)
+
+            monthly = df.groupby(['MONTHYEAR', 'MONTHYEAR_SORT']).agg(
+                Investigations=('INVESTIGATION_ID', 'count'),
+                Avg_Fraud_Score=('FRAUD_SCORE', 'mean'),
+                Fraud_Detected=('FRAUD_AMOUNT_DETECTED', 'sum'),
+                Recovery=('RECOVERY_AMOUNT', 'sum'),
+                Cost=('INVESTIGATION_COST', 'sum'),
+            ).reset_index().sort_values('MONTHYEAR_SORT')
+
+            # Calculate MoM% change
+            for col in ['Investigations', 'Avg_Fraud_Score', 'Fraud_Detected', 'Recovery', 'Cost']:
+                monthly[f'{col}_MoM'] = monthly[col].pct_change() * 100
+
+            tc1, tc2 = st.columns([3, 1])
+            with tc2:
+                metric_choice = st.selectbox("Primary Metric", ["Investigations", "Avg_Fraud_Score", "Fraud_Detected", "Recovery", "Cost"], key="trend_metric")
+                show_mom = st.checkbox("Show MoM% Change", value=True, key="trend_mom")
+
+            with tc1:
+                sort_order = monthly['MONTHYEAR'].tolist()
+                base = alt.Chart(monthly).encode(
+                    x=alt.X('MONTHYEAR:N', sort=sort_order, title=None, axis=alt.Axis(labelAngle=-45)),
+                    tooltip=['MONTHYEAR', alt.Tooltip(f'{metric_choice}:Q', format=',.1f')]
+                )
+                area = base.mark_area(line=True, opacity=0.12, color=alt.Gradient(
+                    gradient='linear',
+                    stops=[alt.GradientStop(color='#6366f1', offset=0), alt.GradientStop(color='transparent', offset=1)],
+                    x1=1, x2=1, y1=1, y2=0
+                )).encode(y=alt.Y(f'{metric_choice}:Q', title=metric_choice.replace('_', ' ')))
+                line = base.mark_line(strokeWidth=2.5, color='#6366f1').encode(y=alt.Y(f'{metric_choice}:Q'))
+                points = base.mark_circle(size=50, color='#818cf8', opacity=1).encode(y=alt.Y(f'{metric_choice}:Q'))
+                trend_chart = (area + line + points).properties(height=350)
+                st.altair_chart(trend_chart, use_container_width=True)
+
+            if show_mom and f'{metric_choice}_MoM' in monthly.columns:
+                mom_col = f'{metric_choice}_MoM'
+                mom_chart = alt.Chart(monthly.dropna(subset=[mom_col])).mark_bar(cornerRadiusEnd=3).encode(
+                    x=alt.X('MONTHYEAR:N', sort=sort_order, title=None, axis=alt.Axis(labelAngle=-45)),
+                    y=alt.Y(f'{mom_col}:Q', title='MoM Change (%)'),
+                    color=alt.condition(
+                        alt.datum[mom_col] > 0,
+                        alt.value('#ef4444'),
+                        alt.value('#10b981')
+                    ),
+                    tooltip=['MONTHYEAR', alt.Tooltip(f'{mom_col}:Q', format='+.1f', title='MoM %')]
+                ).properties(height=180, title=f'{metric_choice} \u2014 Month-over-Month % Change')
+                st.altair_chart(mom_chart, use_container_width=True)
+
+            # Trend summary KPIs
+            if len(monthly) >= 2:
+                latest = monthly.iloc[-1]
+                prev = monthly.iloc[-2]
+                tm1, tm2, tm3, tm4 = st.columns(4, gap="small")
+                inv_chg = ((latest['Investigations'] - prev['Investigations']) / prev['Investigations'] * 100) if prev['Investigations'] > 0 else 0
+                fraud_chg = ((latest['Fraud_Detected'] - prev['Fraud_Detected']) / prev['Fraud_Detected'] * 100) if prev['Fraud_Detected'] > 0 else 0
+                rec_chg = ((latest['Recovery'] - prev['Recovery']) / prev['Recovery'] * 100) if prev['Recovery'] > 0 else 0
+                score_chg = latest['Avg_Fraud_Score'] - prev['Avg_Fraud_Score']
+                tm1.metric("Latest Investigations", f"{int(latest['Investigations']):,}", delta=f"{inv_chg:+.1f}%")
+                tm2.metric("Fraud Detected (AED)", f"{latest['Fraud_Detected']:,.0f}", delta=f"{fraud_chg:+.1f}%")
+                tm3.metric("Recovery (AED)", f"{latest['Recovery']:,.0f}", delta=f"{rec_chg:+.1f}%")
+                tm4.metric("Avg Fraud Score", f"{latest['Avg_Fraud_Score']:.1f}", delta=f"{score_chg:+.1f}")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+            # === SECTION 2: Cohort Heatmap for Emerging Scheme Detection ===
+            st.markdown("""<div class="glass-card"><div class="section-header">
+                <span class="section-header-icon">\U0001F9EA</span>
+                <span class="section-header-text">Cohort Analysis \u2014 Emerging Scheme Detection</span>
+            </div>""", unsafe_allow_html=True)
+
+            try:
+                cohort_query = """
+                    SELECT fc.CLAIM_TYPE, fc.BUSINESS_LINE, fi.MONTHYEAR, fi.MONTHYEAR_SORT,
+                           COUNT(*) as cases, AVG(fi.FRAUD_SCORE) as avg_score,
+                           SUM(fi.FRAUD_AMOUNT_DETECTED) as total_fraud,
+                           SUM(CASE WHEN fi.FINDINGS = 'FRAUD_CONFIRMED' THEN 1 ELSE 0 END) as confirmed
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
+                    JOIN uae_insurance.uae_silver.fact_claim fc
+                        ON fi.FRAUD_KEY_NEW = fc.FRAUD_KEY_NEW
+                    GROUP BY fc.CLAIM_TYPE, fc.BUSINESS_LINE, fi.MONTHYEAR, fi.MONTHYEAR_SORT
+                    ORDER BY fi.MONTHYEAR_SORT
+                """
+                cohort_df = execute_sql(cohort_query)
+
+                if not cohort_df.empty:
+                    cohort_df['MONTHYEAR_SORT'] = pd.to_numeric(cohort_df['MONTHYEAR_SORT'], errors='coerce').fillna(0).astype(int)
+                    cohort_df['cases'] = pd.to_numeric(cohort_df['cases'], errors='coerce').fillna(0)
+                    cohort_df['avg_score'] = pd.to_numeric(cohort_df['avg_score'], errors='coerce').fillna(0)
+                    cohort_df['total_fraud'] = pd.to_numeric(cohort_df['total_fraud'], errors='coerce').fillna(0)
+                    cohort_df['confirmed'] = pd.to_numeric(cohort_df['confirmed'], errors='coerce').fillna(0)
+
+                    ch_tab1, ch_tab2 = st.tabs(["\U0001F525 By Claim Type", "\U0001F3E2 By Business Line"])
+
+                    with ch_tab1:
+                        heatmap_data = cohort_df.groupby(['CLAIM_TYPE', 'MONTHYEAR', 'MONTHYEAR_SORT']).agg(
+                            cases=('cases', 'sum'), avg_score=('avg_score', 'mean')
+                        ).reset_index()
+                        sort_months = heatmap_data.sort_values('MONTHYEAR_SORT')['MONTHYEAR'].unique().tolist()
+
+                        heatmap = alt.Chart(heatmap_data).mark_rect(cornerRadius=3).encode(
+                            x=alt.X('MONTHYEAR:N', sort=sort_months, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y('CLAIM_TYPE:N', title=None),
+                            color=alt.Color('cases:Q', scale=alt.Scale(scheme='inferno'), title='Cases'),
+                            tooltip=[
+                                alt.Tooltip('CLAIM_TYPE', title='Claim Type'),
+                                alt.Tooltip('MONTHYEAR', title='Month'),
+                                alt.Tooltip('cases:Q', title='Cases'),
+                                alt.Tooltip('avg_score:Q', title='Avg Score', format='.1f')
+                            ]
+                        ).properties(height=380, title='Fraud Investigation Volume by Claim Type')
+                        st.altair_chart(heatmap, use_container_width=True)
+
+                        # Emerging scheme alerts
+                        type_monthly = cohort_df.groupby(['CLAIM_TYPE', 'MONTHYEAR_SORT']).agg(cases=('cases', 'sum')).reset_index()
+                        type_monthly = type_monthly.sort_values(['CLAIM_TYPE', 'MONTHYEAR_SORT'])
+                        type_monthly['prev_cases'] = type_monthly.groupby('CLAIM_TYPE')['cases'].shift(1)
+                        type_monthly['growth'] = ((type_monthly['cases'] - type_monthly['prev_cases']) / type_monthly['prev_cases'] * 100)
+                        latest_sort = type_monthly['MONTHYEAR_SORT'].max()
+                        alerts = type_monthly[(type_monthly['MONTHYEAR_SORT'] == latest_sort) & (type_monthly['growth'] > 50)]
+
+                        if not alerts.empty:
+                            st.markdown("**\u26A0\uFE0F Emerging Scheme Alerts** (>50% MoM growth in latest month):")
+                            for _, row in alerts.iterrows():
+                                st.markdown(f"- **{row['CLAIM_TYPE']}**: +{row['growth']:.0f}% ({int(row['prev_cases'])} \u2192 {int(row['cases'])} cases)")
+                        else:
+                            st.success("No anomalous scheme acceleration detected in the latest period.")
+
+                    with ch_tab2:
+                        bl_monthly = cohort_df.groupby(['BUSINESS_LINE', 'MONTHYEAR', 'MONTHYEAR_SORT']).agg(
+                            cases=('cases', 'sum'), total_fraud=('total_fraud', 'sum')
+                        ).reset_index().sort_values('MONTHYEAR_SORT')
+                        sort_months_bl = bl_monthly.sort_values('MONTHYEAR_SORT')['MONTHYEAR'].unique().tolist()
+
+                        bl_chart = alt.Chart(bl_monthly).mark_area(opacity=0.7).encode(
+                            x=alt.X('MONTHYEAR:N', sort=sort_months_bl, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y('cases:Q', title='Cases', stack='zero'),
+                            color=alt.Color('BUSINESS_LINE:N', scale=alt.Scale(scheme='tableau10'), title='Business Line'),
+                            tooltip=[
+                                alt.Tooltip('BUSINESS_LINE'),
+                                alt.Tooltip('MONTHYEAR'),
+                                alt.Tooltip('cases:Q', title='Cases'),
+                                alt.Tooltip('total_fraud:Q', title='Fraud Detected', format=',.0f')
+                            ]
+                        ).properties(height=350, title='Fraud Cases by Business Line (Stacked)')
+                        st.altair_chart(bl_chart, use_container_width=True)
+
+                        bl_total = bl_monthly.groupby('MONTHYEAR')['cases'].transform('sum')
+                        bl_monthly['pct_share'] = (bl_monthly['cases'] / bl_total * 100).round(1)
+                        bl_pct_chart = alt.Chart(bl_monthly).mark_area(opacity=0.85).encode(
+                            x=alt.X('MONTHYEAR:N', sort=sort_months_bl, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y('pct_share:Q', title='% Share', stack='normalize'),
+                            color=alt.Color('BUSINESS_LINE:N', scale=alt.Scale(scheme='tableau10')),
+                            tooltip=['BUSINESS_LINE', 'MONTHYEAR', alt.Tooltip('pct_share:Q', format='.1f', title='% Share')]
+                        ).properties(height=280, title='Business Line Composition Shift Over Time')
+                        st.altair_chart(bl_pct_chart, use_container_width=True)
+
+            except Exception as e:
+                st.warning(f"Cohort analysis unavailable: {e}")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+            # === SECTION 3: Geographic Fraud Concentration by Emirates ===
+            st.markdown("""<div class="glass-card"><div class="section-header">
+                <span class="section-header-icon">\U0001F30D</span>
+                <span class="section-header-text">Geographic Fraud Concentration by Emirates</span>
+            </div>""", unsafe_allow_html=True)
+
+            try:
+                geo_query = """
+                    SELECT dc.EMIRATES as emirate,
+                           COUNT(fi.INVESTIGATION_ID) as investigations,
+                           AVG(fi.FRAUD_SCORE) as avg_fraud_score,
+                           SUM(fi.FRAUD_AMOUNT_DETECTED) as total_fraud_detected,
+                           SUM(fi.RECOVERY_AMOUNT) as total_recovery,
+                           SUM(CASE WHEN fi.FINDINGS = 'FRAUD_CONFIRMED' THEN 1 ELSE 0 END) as confirmed_fraud,
+                           MAX(le.`"population"`) as population
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
+                    JOIN uae_insurance.uae_silver.fact_claim fc
+                        ON fi.FRAUD_KEY_NEW = fc.FRAUD_KEY_NEW
+                    JOIN uae_insurance.uae_silver.dim_customer dc
+                        ON fc.CUSTOMER_KEY = dc.CUSTOMER_KEY
+                    LEFT JOIN uae_insurance.uae_silver.lookup_emirates le
+                        ON dc.EMIRATES = le.`"emirates_code"`
+                    WHERE dc.EMIRATES IS NOT NULL
+                    GROUP BY dc.EMIRATES
+                    ORDER BY investigations DESC
+                """
+                geo_df = execute_sql(geo_query)
+
+                if not geo_df.empty:
+                    for col in ['investigations', 'avg_fraud_score', 'total_fraud_detected', 'total_recovery', 'confirmed_fraud', 'population']:
+                        geo_df[col] = pd.to_numeric(geo_df[col], errors='coerce').fillna(0)
+
+                    geo_df['fraud_per_100k'] = (geo_df['investigations'] / geo_df['population'].replace(0, 1) * 100000).round(1)
+                    geo_df.loc[geo_df['population'] == 0, 'fraud_per_100k'] = 0
+                    geo_df['confirmation_rate'] = (geo_df['confirmed_fraud'] / geo_df['investigations'].replace(0, 1) * 100).round(1)
+                    geo_df['avg_fraud_per_case'] = (geo_df['total_fraud_detected'] / geo_df['investigations'].replace(0, 1)).round(0)
+
+                    gc1, gc2, gc3, gc4 = st.columns(4, gap="small")
+                    top_emirate = geo_df.iloc[0]
+                    highest_density = geo_df.loc[geo_df['fraud_per_100k'].idxmax()] if (geo_df['fraud_per_100k'] > 0).any() else geo_df.iloc[0]
+                    gc1.metric("Most Cases", f"{top_emirate['emirate']}", delta=f"{int(top_emirate['investigations'])} cases")
+                    gc2.metric("Highest Density", f"{highest_density['emirate']}", delta=f"{highest_density['fraud_per_100k']:.0f}/100k pop")
+                    gc3.metric("Total Fraud (AED)", f"{geo_df['total_fraud_detected'].sum():,.0f}")
+                    gc4.metric("Avg Confirmation", f"{geo_df['confirmation_rate'].mean():.1f}%")
+
+                    geo_col1, geo_col2 = st.columns(2)
+                    with geo_col1:
+                        bar_geo = alt.Chart(geo_df).mark_bar(cornerRadiusEnd=4).encode(
+                            x=alt.X('investigations:Q', title='Investigations'),
+                            y=alt.Y('emirate:N', sort='-x', title=None),
+                            color=alt.Color('avg_fraud_score:Q', scale=alt.Scale(scheme='reds'), title='Avg Score'),
+                            tooltip=[
+                                alt.Tooltip('emirate', title='Emirate'),
+                                alt.Tooltip('investigations:Q', title='Cases'),
+                                alt.Tooltip('avg_fraud_score:Q', format='.1f', title='Avg Fraud Score'),
+                                alt.Tooltip('total_fraud_detected:Q', format=',.0f', title='Total Fraud (AED)'),
+                            ]
+                        ).properties(height=280, title='Fraud Investigations by Emirate')
+                        st.altair_chart(bar_geo, use_container_width=True)
+
+                    with geo_col2:
+                        bar_density = alt.Chart(geo_df[geo_df['population'] > 0]).mark_bar(cornerRadiusEnd=4).encode(
+                            x=alt.X('fraud_per_100k:Q', title='Cases per 100k Population'),
+                            y=alt.Y('emirate:N', sort='-x', title=None),
+                            color=alt.Color('confirmation_rate:Q', scale=alt.Scale(scheme='oranges'), title='Confirm %'),
+                            tooltip=[
+                                alt.Tooltip('emirate', title='Emirate'),
+                                alt.Tooltip('fraud_per_100k:Q', format='.1f', title='Per 100k'),
+                                alt.Tooltip('confirmation_rate:Q', format='.1f', title='Confirm Rate %'),
+                                alt.Tooltip('population:Q', format=',.0f', title='Population'),
+                            ]
+                        ).properties(height=280, title='Fraud Density (Population-Normalized)')
+                        st.altair_chart(bar_density, use_container_width=True)
+
+                    with st.expander("Detailed Geographic Breakdown", expanded=False):
+                        display_geo = geo_df[['emirate', 'investigations', 'fraud_per_100k', 'avg_fraud_score',
+                                              'total_fraud_detected', 'total_recovery', 'confirmation_rate', 'avg_fraud_per_case']].copy()
+                        display_geo.columns = ['Emirate', 'Cases', 'Per 100k Pop', 'Avg Score', 'Total Fraud (AED)',
+                                              'Recovery (AED)', 'Confirm Rate %', 'Avg Fraud/Case (AED)']
+                        st.dataframe(display_geo, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.warning(f"Geographic analysis unavailable: {e}")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+            # === SECTION 4: Business Line Trend Decomposition ===
+            st.markdown("""<div class="glass-card"><div class="section-header">
+                <span class="section-header-icon">\U0001F3ED</span>
+                <span class="section-header-text">Business Line Trend Decomposition</span>
+            </div>""", unsafe_allow_html=True)
+
+            try:
+                bl_decomp_query = """
+                    SELECT fc.BUSINESS_LINE, fi.MONTHYEAR, fi.MONTHYEAR_SORT,
+                           COUNT(*) as cases,
+                           SUM(fi.FRAUD_AMOUNT_DETECTED) as fraud_amount,
+                           SUM(fi.RECOVERY_AMOUNT) as recovery,
+                           AVG(fi.FRAUD_SCORE) as avg_score,
+                           AVG(fi.INVESTIGATION_DAYS) as avg_days
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
+                    JOIN uae_insurance.uae_silver.fact_claim fc
+                        ON fi.FRAUD_KEY_NEW = fc.FRAUD_KEY_NEW
+                    GROUP BY fc.BUSINESS_LINE, fi.MONTHYEAR, fi.MONTHYEAR_SORT
+                    ORDER BY fi.MONTHYEAR_SORT
+                """
+                bl_decomp = execute_sql(bl_decomp_query)
+
+                if not bl_decomp.empty:
+                    for col in ['cases', 'fraud_amount', 'recovery', 'avg_score', 'avg_days', 'MONTHYEAR_SORT']:
+                        bl_decomp[col] = pd.to_numeric(bl_decomp[col], errors='coerce').fillna(0)
+
+                    bl_sort = bl_decomp.sort_values('MONTHYEAR_SORT')['MONTHYEAR'].unique().tolist()
+                    decomp_metric = st.selectbox("Decomposition Metric", ["cases", "fraud_amount", "recovery", "avg_score"], key="bl_decomp_metric",
+                                                  format_func=lambda x: {'cases': 'Case Volume', 'fraud_amount': 'Fraud Amount (AED)', 'recovery': 'Recovery (AED)', 'avg_score': 'Avg Fraud Score'}[x])
+
+                    stacked = alt.Chart(bl_decomp).mark_area(opacity=0.75, line=True).encode(
+                        x=alt.X('MONTHYEAR:N', sort=bl_sort, title=None, axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y(f'{decomp_metric}:Q', title=decomp_metric.replace('_', ' ').title(), stack='zero'),
+                        color=alt.Color('BUSINESS_LINE:N', scale=alt.Scale(
+                            domain=['MOTOR', 'MARINE', 'PROPERTY', 'FAMILY', 'MEDICAL'],
+                            range=['#818cf8', '#34d399', '#f59e0b', '#f87171', '#60a5fa']
+                        ), title='Business Line'),
+                        tooltip=['BUSINESS_LINE', 'MONTHYEAR', alt.Tooltip(f'{decomp_metric}:Q', format=',.1f')]
+                    ).properties(height=350, title=f'Business Line Decomposition \u2014 {decomp_metric.replace("_", " ").title()}')
+                    st.altair_chart(stacked, use_container_width=True)
+
+                    with st.expander("Individual Business Line Trends", expanded=False):
+                        small_multiples = alt.Chart(bl_decomp).mark_line(strokeWidth=2).encode(
+                            x=alt.X('MONTHYEAR:N', sort=bl_sort, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y(f'{decomp_metric}:Q', title=None),
+                            color=alt.Color('BUSINESS_LINE:N', legend=None),
+                            tooltip=['BUSINESS_LINE', 'MONTHYEAR', alt.Tooltip(f'{decomp_metric}:Q', format=',.1f')]
+                        ).properties(height=150, width=250).facet(
+                            facet='BUSINESS_LINE:N', columns=3
+                        )
+                        st.altair_chart(small_multiples, use_container_width=True)
+
+            except Exception as e:
+                st.warning(f"Business line decomposition unavailable: {e}")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+            # === SECTION 5: Risk Velocity & Anomaly Detection ===
+            st.markdown("""<div class="glass-card"><div class="section-header">
+                <span class="section-header-icon">\u26A1</span>
+                <span class="section-header-text">Risk Velocity & Anomaly Detection</span>
+            </div>""", unsafe_allow_html=True)
+
+            try:
+                risk_query = """
+                    SELECT fc.RISK_RATING, fi.MONTHYEAR, fi.MONTHYEAR_SORT,
+                           COUNT(*) as cases,
+                           AVG(fi.FRAUD_SCORE) as avg_score,
+                           SUM(fi.FRAUD_AMOUNT_DETECTED) as fraud_amount,
+                           SUM(CASE WHEN fi.FINDINGS = 'FRAUD_CONFIRMED' THEN 1 ELSE 0 END) as confirmed
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
+                    JOIN uae_insurance.uae_silver.fact_claim fc
+                        ON fi.FRAUD_KEY_NEW = fc.FRAUD_KEY_NEW
+                    GROUP BY fc.RISK_RATING, fi.MONTHYEAR, fi.MONTHYEAR_SORT
+                    ORDER BY fi.MONTHYEAR_SORT
+                """
+                risk_df = execute_sql(risk_query)
+
+                if not risk_df.empty:
+                    for col in ['cases', 'avg_score', 'fraud_amount', 'confirmed', 'MONTHYEAR_SORT']:
+                        risk_df[col] = pd.to_numeric(risk_df[col], errors='coerce').fillna(0)
+                    risk_df['confirm_rate'] = (risk_df['confirmed'] / risk_df['cases'] * 100).round(1)
+
+                    risk_sort = risk_df.sort_values('MONTHYEAR_SORT')['MONTHYEAR'].unique().tolist()
+
+                    rv1, rv2 = st.columns(2)
+                    with rv1:
+                        risk_pct = alt.Chart(risk_df).mark_area(opacity=0.85).encode(
+                            x=alt.X('MONTHYEAR:N', sort=risk_sort, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y('cases:Q', title='Cases', stack='normalize'),
+                            color=alt.Color('RISK_RATING:N', scale=alt.Scale(
+                                domain=['HIGH', 'MEDIUM', 'LOW'],
+                                range=['#ef4444', '#f59e0b', '#10b981']
+                            ), title='Risk Rating'),
+                            tooltip=['RISK_RATING', 'MONTHYEAR', alt.Tooltip('cases:Q', title='Cases')]
+                        ).properties(height=300, title='Risk Mix Composition Shift')
+                        st.altair_chart(risk_pct, use_container_width=True)
+
+                    with rv2:
+                        risk_score_trend = alt.Chart(risk_df).mark_line(strokeWidth=2.5, point=True).encode(
+                            x=alt.X('MONTHYEAR:N', sort=risk_sort, title=None, axis=alt.Axis(labelAngle=-45)),
+                            y=alt.Y('avg_score:Q', title='Avg Fraud Score'),
+                            color=alt.Color('RISK_RATING:N', scale=alt.Scale(
+                                domain=['HIGH', 'MEDIUM', 'LOW'],
+                                range=['#ef4444', '#f59e0b', '#10b981']
+                            )),
+                            tooltip=['RISK_RATING', 'MONTHYEAR', alt.Tooltip('avg_score:Q', format='.1f')]
+                        ).properties(height=300, title='Fraud Score Trajectory by Risk Rating')
+                        st.altair_chart(risk_score_trend, use_container_width=True)
+
+                    # Velocity alerts for HIGH risk
+                    high_risk = risk_df[risk_df['RISK_RATING'] == 'HIGH'].sort_values('MONTHYEAR_SORT')
+                    if len(high_risk) >= 2:
+                        latest_hr = high_risk.iloc[-1]
+                        prev_hr = high_risk.iloc[-2]
+                        hr_growth = ((latest_hr['cases'] - prev_hr['cases']) / prev_hr['cases'] * 100) if prev_hr['cases'] > 0 else 0
+                        hr_score_delta = latest_hr['avg_score'] - prev_hr['avg_score']
+                        total_latest = risk_df[risk_df['MONTHYEAR_SORT'] == risk_df['MONTHYEAR_SORT'].max()]['cases'].sum()
+                        hr_share = (latest_hr['cases'] / total_latest * 100) if total_latest > 0 else 0
+
+                        al1, al2, al3, al4 = st.columns(4, gap="small")
+                        al1.metric("HIGH Risk Volume Change", f"{hr_growth:+.1f}%", delta="alert" if hr_growth > 25 else "stable", delta_color="inverse")
+                        al2.metric("HIGH Risk Score Delta", f"{hr_score_delta:+.1f}", delta="rising" if hr_score_delta > 0 else "falling", delta_color="inverse")
+                        al3.metric("HIGH Risk Share", f"{hr_share:.1f}%")
+                        al4.metric("HIGH Confirm Rate", f"{latest_hr['confirm_rate']:.1f}%")
+
+                        if hr_growth > 25 or hr_score_delta > 5:
+                            st.error(f"\u26A0\uFE0F **Risk Velocity Alert**: HIGH-risk cases {'surging' if hr_growth > 25 else 'intensifying'} "
+                                    f"({hr_growth:+.0f}% volume, {hr_score_delta:+.1f} score shift). "
+                                    f"Recommend increased investigator allocation to HIGH-risk pipeline.")
+                        elif hr_growth < -10:
+                            st.success(f"\u2705 HIGH-risk volume declining ({hr_growth:+.0f}%). Current mitigation strategies appear effective.")
+                        else:
+                            st.info(f"\u2139\uFE0F HIGH-risk metrics stable. Volume change: {hr_growth:+.1f}%, Score delta: {hr_score_delta:+.1f}")
+
+                    with st.expander("Risk-Findings Cross Analysis", expanded=False):
+                        risk_findings = risk_df.groupby('RISK_RATING').agg(
+                            total_cases=('cases', 'sum'),
+                            avg_fraud_score=('avg_score', 'mean'),
+                            total_fraud=('fraud_amount', 'sum'),
+                            total_confirmed=('confirmed', 'sum')
+                        ).reset_index()
+                        risk_findings['confirm_rate'] = (risk_findings['total_confirmed'] / risk_findings['total_cases'] * 100).round(1)
+                        risk_findings['avg_fraud_per_case'] = (risk_findings['total_fraud'] / risk_findings['total_cases']).round(0)
+                        risk_findings.columns = ['Risk Rating', 'Total Cases', 'Avg Score', 'Total Fraud (AED)', 'Confirmed', 'Confirm Rate %', 'Fraud/Case (AED)']
+                        st.dataframe(risk_findings, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.warning(f"Risk velocity analysis unavailable: {e}")
+
+            st.markdown("</div>", unsafe_allow_html=True)
 
 # --- PAGE: Investigator Performance ---
 elif page == "\U0001F3C6  Investigator Performance":
     if not df.empty:
         st.markdown("""<div class="section-header">
             <span class="section-header-icon">\U0001F3C6</span>
-            <span class="section-header-text">Investigator Performance Scoreboard</span>
+            <span class="section-header-text">Investigator Performance Analytics</span>
         </div>""", unsafe_allow_html=True)
-        inv_perf = df.groupby('INVESTIGATOR_ID').agg(Cases=('INVESTIGATION_ID', 'count'), Avg_Score=('FRAUD_SCORE', 'mean'), Avg_Days=('INVESTIGATION_DAYS', 'mean'), Total_Recovered=('RECOVERY_AMOUNT', 'sum'), Total_Cost=('INVESTIGATION_COST', 'sum'), Fraud_Confirmed=('FINDINGS', lambda x: (x == 'FRAUD_CONFIRMED').sum())).reset_index()
-        inv_perf['ROI'] = ((inv_perf['Total_Recovered'] - inv_perf['Total_Cost']) / inv_perf['Total_Cost'] * 100).round(1)
-        enhanced_dataframe(inv_perf.sort_values('ROI', ascending=False).reset_index(drop=True), title='Investigator Performance', key_prefix='inv_perf', height=500)
+        st.caption("Individual and team-level operational analytics for performance management, quality assurance, and training investment decisions.")
+
+        # Build comprehensive investigator metrics
+        inv_perf = df.groupby('INVESTIGATOR_ID').agg(
+            Cases=('INVESTIGATION_ID', 'count'),
+            Avg_Score=('FRAUD_SCORE', 'mean'),
+            Avg_Days=('INVESTIGATION_DAYS', 'mean'),
+            Median_Days=('INVESTIGATION_DAYS', 'median'),
+            Total_Recovered=('RECOVERY_AMOUNT', 'sum'),
+            Total_Cost=('INVESTIGATION_COST', 'sum'),
+            Total_Fraud_Detected=('FRAUD_AMOUNT_DETECTED', 'sum'),
+            Fraud_Confirmed=('FINDINGS', lambda x: (x == 'FRAUD_CONFIRMED').sum()),
+            No_Fraud=('FINDINGS', lambda x: (x == 'NO_FRAUD').sum()),
+            Completed=('INVESTIGATION_STATUS', lambda x: (x.isin(['COMPLETED', 'CLOSED'])).sum())
+        ).reset_index()
+        inv_perf['Confirm_Rate'] = (inv_perf['Fraud_Confirmed'] / inv_perf['Cases'] * 100).round(1)
+        inv_perf['Resolution_Rate'] = (inv_perf['Completed'] / inv_perf['Cases'] * 100).round(1)
+        inv_perf['ROI'] = ((inv_perf['Total_Recovered'] - inv_perf['Total_Cost']) / inv_perf['Total_Cost'].replace(0, 1) * 100).round(1)
+        inv_perf['Recovery_Efficiency'] = (inv_perf['Total_Recovered'] / inv_perf['Total_Fraud_Detected'].replace(0, 1) * 100).round(1)
+        inv_perf['Cost_Per_Case'] = (inv_perf['Total_Cost'] / inv_perf['Cases']).round(0)
+        inv_perf['False_Positive_Rate'] = (inv_perf['No_Fraud'] / inv_perf['Cases'] * 100).round(1)
+
+        # ============================================================
+        # TEAM-WIDE KPIs
+        # ============================================================
+        team_avg_days = df['INVESTIGATION_DAYS'].mean()
+        team_confirm_rate = (df['FINDINGS'] == 'FRAUD_CONFIRMED').sum() / len(df) * 100
+        team_resolution_rate = df['INVESTIGATION_STATUS'].isin(['COMPLETED', 'CLOSED']).sum() / len(df) * 100
+        team_recovery_eff = (df['RECOVERY_AMOUNT'].sum() / df['FRAUD_AMOUNT_DETECTED'].sum() * 100) if df['FRAUD_AMOUNT_DETECTED'].sum() > 0 else 0
+        total_investigators = inv_perf['INVESTIGATOR_ID'].nunique()
+        top_performer = inv_perf.sort_values('ROI', ascending=False).iloc[0]['INVESTIGATOR_ID'] if not inv_perf.empty else 'N/A'
+
+        tk1, tk2, tk3, tk4, tk5, tk6 = st.columns(6, gap="small")
+        tk1.metric("Team Size", total_investigators)
+        tk2.metric("Avg Resolution", f"{team_avg_days:.1f} days")
+        tk3.metric("Confirm Rate", f"{team_confirm_rate:.1f}%")
+        tk4.metric("Resolution Rate", f"{team_resolution_rate:.1f}%")
+        tk5.metric("Recovery Efficiency", f"{team_recovery_eff:.1f}%")
+        tk6.metric("Top Performer", top_performer)
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 1: PERFORMANCE QUADRANT
+        # ============================================================
+        st.subheader("\U0001F3AF Performance Quadrant: Speed vs Accuracy")
+        st.caption("Bubble size = caseload. Ideal position: lower-left (fast) + upper (accurate). Color = ROI.")
+
+        pq1, pq2 = st.columns([3, 1], gap="large")
+        with pq1:
+            quadrant = alt.Chart(inv_perf).mark_circle(opacity=0.75, stroke='#1e293b', strokeWidth=1).encode(
+                x=alt.X('Avg_Days:Q', title='Avg Investigation Days (Speed)', scale=alt.Scale(zero=False)),
+                y=alt.Y('Confirm_Rate:Q', title='Fraud Confirmation Rate (%) (Accuracy)', scale=alt.Scale(zero=False)),
+                size=alt.Size('Cases:Q', title='Caseload', scale=alt.Scale(range=[80, 600])),
+                color=alt.Color('ROI:Q', scale=alt.Scale(scheme='redyellowgreen'), title='ROI (%)'),
+                tooltip=['INVESTIGATOR_ID',
+                        alt.Tooltip('Cases:Q', title='Cases'),
+                        alt.Tooltip('Avg_Days:Q', format='.1f', title='Avg Days'),
+                        alt.Tooltip('Confirm_Rate:Q', format='.1f', title='Confirm %'),
+                        alt.Tooltip('ROI:Q', format='.1f', title='ROI %'),
+                        alt.Tooltip('Total_Recovered:Q', format=',.0f', title='Recovered (AED)')]
+            ).properties(height=380)
+
+            # Team average reference lines
+            h_rule = alt.Chart(pd.DataFrame({'y': [team_confirm_rate]})).mark_rule(strokeDash=[4,4], color='#6366f1', opacity=0.6).encode(y='y:Q')
+            v_rule = alt.Chart(pd.DataFrame({'x': [team_avg_days]})).mark_rule(strokeDash=[4,4], color='#6366f1', opacity=0.6).encode(x='x:Q')
+            st.altair_chart((quadrant + h_rule + v_rule), use_container_width=True)
+
+        with pq2:
+            st.markdown("**Quadrant Legend**")
+            st.markdown("""
+            <div style="font-size:0.85rem;line-height:1.8;">
+            \U0001F31F <strong>Top-Left</strong>: Fast & Accurate<br>
+            \U0001F4AA <strong>Top-Right</strong>: Accurate but Slow<br>
+            \u26A1 <strong>Bottom-Left</strong>: Fast but Low Confirm<br>
+            \u26A0\uFE0F <strong>Bottom-Right</strong>: Needs Coaching
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown(f"\n**Benchmarks** (dashed lines)")
+            st.markdown(f"Avg Days: **{team_avg_days:.1f}**")
+            st.markdown(f"Avg Confirm: **{team_confirm_rate:.1f}%**")
+
+            # Identify coaching needs
+            needs_coaching = inv_perf[(inv_perf['Avg_Days'] > team_avg_days) & (inv_perf['Confirm_Rate'] < team_confirm_rate)]
+            if not needs_coaching.empty:
+                st.warning(f"{len(needs_coaching)} investigator(s) below benchmarks on both axes")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 2: TEAM BENCHMARKING
+        # ============================================================
+        st.subheader("\U0001F4CA Team Benchmarking & Rankings")
+
+        bench_metric = st.selectbox("Rank by:", ['ROI', 'Confirm_Rate', 'Avg_Days', 'Resolution_Rate', 'Recovery_Efficiency', 'Cases'], key='bench_metric')
+        ascending = bench_metric == 'Avg_Days'  # Lower is better for days
+        ranked = inv_perf.sort_values(bench_metric, ascending=ascending).reset_index(drop=True)
+        ranked['Rank'] = range(1, len(ranked) + 1)
+
+        bk1, bk2 = st.columns([2, 1], gap="large")
+        with bk1:
+            # Horizontal bar ranking
+            bar_color = '#10b981' if not ascending else '#6366f1'
+            rank_chart = alt.Chart(ranked.head(15)).mark_bar(cornerRadiusEnd=4, opacity=0.85).encode(
+                y=alt.Y('INVESTIGATOR_ID:N', sort=alt.EncodingSortField(field=bench_metric, order='descending' if not ascending else 'ascending'), title=None),
+                x=alt.X(f'{bench_metric}:Q', title=bench_metric.replace('_', ' ')),
+                color=alt.Color(f'{bench_metric}:Q', scale=alt.Scale(scheme='redyellowgreen' if bench_metric != 'Avg_Days' else 'redyellowgreen', reverse=(bench_metric == 'Avg_Days')), legend=None),
+                tooltip=['INVESTIGATOR_ID', 'Rank',
+                        alt.Tooltip(f'{bench_metric}:Q', format='.1f'),
+                        alt.Tooltip('Cases:Q', title='Caseload')]
+            ).properties(height=min(400, len(ranked) * 28 + 40), title=f'Investigator Ranking by {bench_metric.replace("_", " ")}')
+
+            # Team average rule
+            team_avg_val = inv_perf[bench_metric].mean()
+            avg_rule = alt.Chart(pd.DataFrame({'x': [team_avg_val]})).mark_rule(strokeDash=[5,3], color='#f59e0b', strokeWidth=2).encode(x='x:Q')
+            st.altair_chart((rank_chart + avg_rule), use_container_width=True)
+
+        with bk2:
+            st.markdown("**Distribution Stats**")
+            st.markdown(f"Mean: **{inv_perf[bench_metric].mean():.1f}**")
+            st.markdown(f"Median: **{inv_perf[bench_metric].median():.1f}**")
+            st.markdown(f"Std Dev: **{inv_perf[bench_metric].std():.1f}**")
+            st.markdown(f"Top 25%: **{inv_perf[bench_metric].quantile(0.75):.1f}**")
+            st.markdown(f"Bottom 25%: **{inv_perf[bench_metric].quantile(0.25):.1f}**")
+
+            # Performance tiers
+            q75 = inv_perf[bench_metric].quantile(0.75)
+            q25 = inv_perf[bench_metric].quantile(0.25)
+            if not ascending:
+                star_count = len(inv_perf[inv_perf[bench_metric] >= q75])
+                risk_count = len(inv_perf[inv_perf[bench_metric] <= q25])
+            else:
+                star_count = len(inv_perf[inv_perf[bench_metric] <= q25])
+                risk_count = len(inv_perf[inv_perf[bench_metric] >= q75])
+            st.markdown(f"\n\U0001F31F Star Performers: **{star_count}**")
+            st.markdown(f"\u26A0\uFE0F Need Support: **{risk_count}**")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 3: QUALITY VS AI SIGNAL ALIGNMENT
+        # ============================================================
+        st.subheader("\U0001F9E0 Quality Scoring vs AI Risk Signal Alignment")
+        st.caption("Measures how well investigator findings align with AI fraud scores. High alignment = investigator confirms fraud when AI score is high.")
+
+        try:
+            # For each investigator: avg AI score for confirmed vs not-confirmed cases
+            alignment_data = df.copy()
+            alignment_data['is_confirmed'] = (alignment_data['FINDINGS'] == 'FRAUD_CONFIRMED').astype(int)
+
+            inv_alignment = alignment_data.groupby('INVESTIGATOR_ID').apply(
+                lambda g: pd.Series({
+                    'avg_score_confirmed': g[g['is_confirmed'] == 1]['FRAUD_SCORE'].mean() if g['is_confirmed'].sum() > 0 else 0,
+                    'avg_score_not_confirmed': g[g['is_confirmed'] == 0]['FRAUD_SCORE'].mean() if (g['is_confirmed'] == 0).sum() > 0 else 0,
+                    'cases': len(g),
+                    'confirm_rate': g['is_confirmed'].mean() * 100
+                })
+            ).reset_index()
+            inv_alignment['score_separation'] = (inv_alignment['avg_score_confirmed'] - inv_alignment['avg_score_not_confirmed']).round(1)
+            inv_alignment['alignment_quality'] = inv_alignment['score_separation'].apply(
+                lambda s: 'Strong' if s >= 15 else ('Moderate' if s >= 5 else 'Weak')
+            )
+
+            qa1, qa2 = st.columns(2, gap="large")
+            with qa1:
+                # Score separation chart
+                sep_chart = alt.Chart(inv_alignment).mark_bar(cornerRadiusEnd=4).encode(
+                    y=alt.Y('INVESTIGATOR_ID:N', sort=alt.EncodingSortField(field='score_separation', order='descending'), title=None),
+                    x=alt.X('score_separation:Q', title='AI Score Separation (Confirmed - Not Confirmed)'),
+                    color=alt.Color('alignment_quality:N', scale=alt.Scale(
+                        domain=['Strong', 'Moderate', 'Weak'],
+                        range=['#10b981', '#f59e0b', '#ef4444']
+                    ), title='Alignment'),
+                    tooltip=['INVESTIGATOR_ID',
+                            alt.Tooltip('score_separation:Q', format='.1f', title='Score Separation'),
+                            alt.Tooltip('avg_score_confirmed:Q', format='.1f', title='Avg Score (Confirmed)'),
+                            alt.Tooltip('avg_score_not_confirmed:Q', format='.1f', title='Avg Score (Not Confirmed)'),
+                            alt.Tooltip('cases:Q', title='Cases')]
+                ).properties(height=min(380, len(inv_alignment) * 26 + 40), title='AI Signal Alignment by Investigator')
+                st.altair_chart(sep_chart, use_container_width=True)
+
+            with qa2:
+                # Alignment quality distribution
+                quality_dist = inv_alignment['alignment_quality'].value_counts()
+                st.markdown("**Alignment Distribution**")
+                for quality in ['Strong', 'Moderate', 'Weak']:
+                    count = quality_dist.get(quality, 0)
+                    icon = {'Strong': '\u2705', 'Moderate': '\u26A0\uFE0F', 'Weak': '\U0001F6A8'}[quality]
+                    color = {'Strong': '#10b981', 'Moderate': '#f59e0b', 'Weak': '#ef4444'}[quality]
+                    st.markdown(f"<span style='color:{color};font-weight:600;'>{icon} {quality}: {count} investigator(s)</span>", unsafe_allow_html=True)
+
+                st.markdown("\n**What this means:**")
+                st.markdown("""
+                <div style="font-size:0.82rem;color:#94a3b8;line-height:1.6;">
+                <strong>Strong</strong>: Confirms fraud when AI score is high, clears when low (\u226515pt gap)<br>
+                <strong>Moderate</strong>: Some alignment with AI signals (5-15pt gap)<br>
+                <strong>Weak</strong>: Findings don't correlate well with AI scores (<5pt gap) \u2014 may need calibration training
+                </div>
+                """, unsafe_allow_html=True)
+
+                weak_investigators = inv_alignment[inv_alignment['alignment_quality'] == 'Weak']
+                if not weak_investigators.empty:
+                    st.error(f"\U0001F6A8 {len(weak_investigators)} investigator(s) with weak AI alignment \u2014 recommend calibration review")
+
+        except Exception as e:
+            st.warning(f"AI alignment analysis unavailable: {e}")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 4: MONTHLY TREND OVERLAYS
+        # ============================================================
+        st.subheader("\U0001F4C8 Performance Trend Overlays")
+
+        try:
+            trend_query = """
+                SELECT INVESTIGATOR_ID, MONTHYEAR, MONTHYEAR_SORT,
+                       COUNT(*) as cases,
+                       AVG(INVESTIGATION_DAYS) as avg_days,
+                       SUM(CASE WHEN FINDINGS = 'FRAUD_CONFIRMED' THEN 1 ELSE 0 END) as confirmed,
+                       SUM(RECOVERY_AMOUNT) as recovery,
+                       AVG(FRAUD_SCORE) as avg_score
+                FROM uae_insurance.uae_silver.fact_fraud_investigation
+                GROUP BY INVESTIGATOR_ID, MONTHYEAR, MONTHYEAR_SORT
+                ORDER BY MONTHYEAR_SORT
+            """
+            trend_df = execute_sql(trend_query)
+
+            if not trend_df.empty:
+                trend_df['MONTHYEAR_SORT'] = pd.to_numeric(trend_df['MONTHYEAR_SORT'], errors='coerce').fillna(0).astype(int)
+                for col in ['cases', 'avg_days', 'confirmed', 'recovery', 'avg_score']:
+                    trend_df[col] = pd.to_numeric(trend_df[col], errors='coerce').fillna(0)
+                trend_df['confirm_rate'] = (trend_df['confirmed'] / trend_df['cases'].replace(0, 1) * 100).round(1)
+                trend_df = trend_df.sort_values('MONTHYEAR_SORT')
+                trend_sort = trend_df['MONTHYEAR'].unique().tolist()
+
+                # Metric selector
+                trend_metric = st.selectbox("Trend Metric:", ['confirm_rate', 'avg_days', 'cases', 'recovery', 'avg_score'], key='inv_trend_metric',
+                                           format_func=lambda x: {'confirm_rate': 'Confirmation Rate (%)', 'avg_days': 'Avg Days', 'cases': 'Caseload', 'recovery': 'Recovery (AED)', 'avg_score': 'Avg Fraud Score'}[x])
+
+                # Select top investigators by case volume for readability
+                top_investigators = inv_perf.nlargest(8, 'Cases')['INVESTIGATOR_ID'].tolist()
+                trend_filtered = trend_df[trend_df['INVESTIGATOR_ID'].isin(top_investigators)]
+
+                tr1, tr2 = st.columns([3, 1], gap="large")
+                with tr1:
+                    trend_chart = alt.Chart(trend_filtered).mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=30)).encode(
+                        x=alt.X('MONTHYEAR:N', sort=trend_sort, title=None, axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y(f'{trend_metric}:Q', title=trend_metric.replace('_', ' ').title()),
+                        color=alt.Color('INVESTIGATOR_ID:N', title='Investigator'),
+                        tooltip=['INVESTIGATOR_ID', 'MONTHYEAR',
+                                alt.Tooltip(f'{trend_metric}:Q', format='.1f'),
+                                alt.Tooltip('cases:Q', title='Cases')]
+                    ).properties(height=350, title=f'Monthly {trend_metric.replace("_", " ").title()} by Investigator (Top 8 by Volume)')
+
+                    # Team average overlay
+                    team_trend = trend_df.groupby('MONTHYEAR').agg(**{trend_metric: (trend_metric, 'mean')}).reset_index()
+                    team_line = alt.Chart(team_trend).mark_line(strokeWidth=3, strokeDash=[6,3], color='#f59e0b', opacity=0.8).encode(
+                        x=alt.X('MONTHYEAR:N', sort=trend_sort),
+                        y=alt.Y(f'{trend_metric}:Q')
+                    )
+                    st.altair_chart((trend_chart + team_line), use_container_width=True)
+                    st.caption("Orange dashed line = team average")
+
+                with tr2:
+                    st.markdown("**Trend Highlights**")
+                    # Identify improving/declining investigators
+                    if len(trend_sort) >= 2:
+                        latest_month = trend_sort[-1]
+                        prev_month = trend_sort[-2]
+                        latest_perf = trend_filtered[trend_filtered['MONTHYEAR'] == latest_month].set_index('INVESTIGATOR_ID')[trend_metric]
+                        prev_perf = trend_filtered[trend_filtered['MONTHYEAR'] == prev_month].set_index('INVESTIGATOR_ID')[trend_metric]
+                        changes = (latest_perf - prev_perf).dropna().sort_values(ascending=(trend_metric == 'avg_days'))
+
+                        if not changes.empty:
+                            best_improver = changes.index[0] if trend_metric != 'avg_days' else changes.index[-1]
+                            worst_decline = changes.index[-1] if trend_metric != 'avg_days' else changes.index[0]
+                            st.markdown(f"\U0001F4C8 Most improved: **{best_improver}**")
+                            st.markdown(f"\U0001F4C9 Biggest decline: **{worst_decline}**")
+
+                    st.markdown(f"\n**Showing:** Top 8 investigators by caseload")
+                    st.markdown(f"**Period:** {trend_sort[0]} \u2192 {trend_sort[-1]}" if trend_sort else "")
+
+        except Exception as e:
+            st.warning(f"Trend analysis unavailable: {e}")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 5: DETAILED SCOREBOARD TABLE
+        # ============================================================
+        st.subheader("\U0001F4CB Full Performance Scoreboard")
+
+        scoreboard = inv_perf[['INVESTIGATOR_ID', 'Cases', 'Confirm_Rate', 'Resolution_Rate', 'Avg_Days',
+                               'Median_Days', 'ROI', 'Recovery_Efficiency', 'Cost_Per_Case',
+                               'False_Positive_Rate', 'Total_Recovered']].copy()
+        scoreboard = scoreboard.sort_values('ROI', ascending=False).reset_index(drop=True)
+        scoreboard.columns = ['Investigator', 'Cases', 'Confirm %', 'Resolution %', 'Avg Days',
+                              'Median Days', 'ROI %', 'Recovery Eff %', 'Cost/Case (AED)',
+                              'False Positive %', 'Total Recovered (AED)']
+        enhanced_dataframe(scoreboard, title='Investigator Performance Scoreboard', key_prefix='inv_perf_full', height=450)
 
 # --- PAGE: ROI Analysis ---
 elif page == "\U0001F4B0  ROI Analysis":
@@ -1186,14 +2167,314 @@ elif page == "\U0001F4B0  ROI Analysis":
             <span class="section-header-icon">\U0001F4B0</span>
             <span class="section-header-text">Return on Investigation (ROI) Analysis</span>
         </div>""", unsafe_allow_html=True)
+
+        # Overall ROI KPIs
         total_cost = df['INVESTIGATION_COST'].sum()
         total_recovered = df['RECOVERY_AMOUNT'].sum()
         net_benefit = total_recovered - total_cost
         overall_roi = (net_benefit / total_cost * 100) if total_cost > 0 else 0
-        c1, c2, c3 = st.columns(3, gap="large")
-        c1.metric("Total Investigation Cost", f"AED {total_cost:,.0f}")
-        c2.metric("Total Recovered", f"AED {total_recovered:,.0f}")
-        c3.metric("Net Benefit", f"AED {net_benefit:,.0f}", delta=f"{overall_roi:.1f}% ROI")
+        fraud_detected = df['FRAUD_AMOUNT_DETECTED'].sum()
+        recovery_rate = (total_recovered / fraud_detected * 100) if fraud_detected > 0 else 0
+
+        k1, k2, k3, k4 = st.columns(4, gap="small")
+        k1.metric("Total Investment", f"AED {total_cost:,.0f}")
+        k2.metric("Total Recovered", f"AED {total_recovered:,.0f}")
+        k3.metric("Net Benefit", f"AED {net_benefit:,.0f}", delta=f"{overall_roi:.1f}% ROI")
+        k4.metric("Recovery Rate", f"{recovery_rate:.1f}%", delta=f"of {fraud_detected:,.0f} detected")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 1: RECOVERY TRACKING
+        # ============================================================
+        st.subheader("\U0001F4C8 Recovery Tracking")
+
+        try:
+            roi_query = """
+                SELECT MONTHYEAR, MONTHYEAR_SORT,
+                       COUNT(*) as cases,
+                       SUM(INVESTIGATION_COST) as total_cost,
+                       SUM(RECOVERY_AMOUNT) as total_recovery,
+                       SUM(FRAUD_AMOUNT_DETECTED) as total_fraud_detected,
+                       AVG(FRAUD_SCORE) as avg_score,
+                       SUM(CASE WHEN FINDINGS = 'FRAUD_CONFIRMED' THEN 1 ELSE 0 END) as confirmed_cases
+                FROM uae_insurance.uae_silver.fact_fraud_investigation
+                GROUP BY MONTHYEAR, MONTHYEAR_SORT
+                ORDER BY MONTHYEAR_SORT
+            """
+            roi_monthly = execute_sql(roi_query)
+
+            if not roi_monthly.empty:
+                roi_monthly['MONTHYEAR_SORT'] = pd.to_numeric(roi_monthly['MONTHYEAR_SORT'], errors='coerce').fillna(0).astype(int)
+                for col in ['cases', 'total_cost', 'total_recovery', 'total_fraud_detected', 'avg_score', 'confirmed_cases']:
+                    roi_monthly[col] = pd.to_numeric(roi_monthly[col], errors='coerce').fillna(0)
+
+                roi_monthly = roi_monthly.sort_values('MONTHYEAR_SORT')
+                roi_monthly['cumulative_cost'] = roi_monthly['total_cost'].cumsum()
+                roi_monthly['cumulative_recovery'] = roi_monthly['total_recovery'].cumsum()
+                roi_monthly['cumulative_roi'] = ((roi_monthly['cumulative_recovery'] - roi_monthly['cumulative_cost']) / roi_monthly['cumulative_cost'] * 100).round(1)
+                roi_monthly['recovery_rate'] = (roi_monthly['total_recovery'] / roi_monthly['total_fraud_detected'].replace(0, 1) * 100).round(1)
+                roi_monthly['cost_per_case'] = (roi_monthly['total_cost'] / roi_monthly['cases'].replace(0, 1)).round(0)
+                roi_monthly['recovery_per_case'] = (roi_monthly['total_recovery'] / roi_monthly['cases'].replace(0, 1)).round(0)
+
+                sort_order = roi_monthly['MONTHYEAR'].tolist()
+
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    # Cost vs Recovery dual-axis
+                    cost_line = alt.Chart(roi_monthly).mark_line(strokeWidth=2.5, color='#ef4444', strokeDash=[5,3]).encode(
+                        x=alt.X('MONTHYEAR:N', sort=sort_order, title=None, axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y('total_cost:Q', title='Amount (AED)'),
+                        tooltip=['MONTHYEAR', alt.Tooltip('total_cost:Q', format=',.0f', title='Cost')]
+                    )
+                    recovery_line = alt.Chart(roi_monthly).mark_line(strokeWidth=2.5, color='#10b981').encode(
+                        x=alt.X('MONTHYEAR:N', sort=sort_order, title=None),
+                        y=alt.Y('total_recovery:Q'),
+                        tooltip=['MONTHYEAR', alt.Tooltip('total_recovery:Q', format=',.0f', title='Recovery')]
+                    )
+                    recovery_area = alt.Chart(roi_monthly).mark_area(opacity=0.1, color='#10b981').encode(
+                        x=alt.X('MONTHYEAR:N', sort=sort_order),
+                        y=alt.Y('total_recovery:Q')
+                    )
+                    st.altair_chart((recovery_area + cost_line + recovery_line).properties(
+                        height=300, title='Monthly: Cost (red dashed) vs Recovery (green)'
+                    ), use_container_width=True)
+
+                with rc2:
+                    # Cumulative ROI trend
+                    cum_chart = alt.Chart(roi_monthly).mark_area(line=True, opacity=0.2, color='#6366f1').encode(
+                        x=alt.X('MONTHYEAR:N', sort=sort_order, title=None, axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y('cumulative_roi:Q', title='Cumulative ROI (%)'),
+                        tooltip=['MONTHYEAR', alt.Tooltip('cumulative_roi:Q', format='.1f', title='Cum. ROI %')]
+                    ).properties(height=300, title='Cumulative ROI Trajectory')
+                    zero_rule = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(strokeDash=[4,4], color='gray').encode(y='y:Q')
+                    st.altair_chart((cum_chart + zero_rule), use_container_width=True)
+
+                # Recovery rate trend
+                rr_chart = alt.Chart(roi_monthly).mark_bar(cornerRadiusEnd=3, color='#8b5cf6', opacity=0.7).encode(
+                    x=alt.X('MONTHYEAR:N', sort=sort_order, title=None, axis=alt.Axis(labelAngle=-45)),
+                    y=alt.Y('recovery_rate:Q', title='Recovery Rate (%)'),
+                    tooltip=['MONTHYEAR', alt.Tooltip('recovery_rate:Q', format='.1f', title='Recovery %')]
+                ).properties(height=200, title='Monthly Recovery Rate (% of Fraud Detected that was Recovered)')
+                st.altair_chart(rr_chart, use_container_width=True)
+
+        except Exception as e:
+            st.warning(f"Recovery tracking unavailable: {e}")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 2: AI LIFT ANALYSIS
+        # ============================================================
+        st.subheader("\U0001F916 AI Lift Analysis")
+
+        try:
+            # Compare high-score (AI-flagged) vs low-score investigations
+            ai_threshold = 70
+            df_ai = df.copy()
+            df_ai['AI_Category'] = df_ai['FRAUD_SCORE'].apply(
+                lambda x: 'AI-Flagged (Score\u226570)' if x >= ai_threshold else 'Traditional (Score<70)'
+            )
+
+            ai_summary = df_ai.groupby('AI_Category').agg(
+                Cases=('INVESTIGATION_ID', 'count'),
+                Avg_Cost=('INVESTIGATION_COST', 'mean'),
+                Total_Recovery=('RECOVERY_AMOUNT', 'sum'),
+                Avg_Recovery=('RECOVERY_AMOUNT', 'mean'),
+                Avg_Days=('INVESTIGATION_DAYS', 'mean'),
+                Confirmed=('FINDINGS', lambda x: (x == 'FRAUD_CONFIRMED').sum())
+            ).reset_index()
+            ai_summary['Confirm_Rate'] = (ai_summary['Confirmed'] / ai_summary['Cases'] * 100).round(1)
+            ai_summary['ROI'] = ((ai_summary['Total_Recovery'] - ai_summary['Avg_Cost'] * ai_summary['Cases']) / (ai_summary['Avg_Cost'] * ai_summary['Cases']) * 100).round(1)
+
+            ai1, ai2 = st.columns(2)
+            with ai1:
+                ai_bar = alt.Chart(ai_summary).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X('AI_Category:N', title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('Confirm_Rate:Q', title='Fraud Confirmation Rate (%)'),
+                    color=alt.Color('AI_Category:N', scale=alt.Scale(
+                        domain=['AI-Flagged (Score\u226570)', 'Traditional (Score<70)'],
+                        range=['#6366f1', '#94a3b8']
+                    ), legend=None),
+                    tooltip=['AI_Category', alt.Tooltip('Confirm_Rate:Q', format='.1f'), alt.Tooltip('Cases:Q', format=',')]
+                ).properties(height=280, title='Fraud Confirmation Rate: AI vs Traditional')
+                st.altair_chart(ai_bar, use_container_width=True)
+
+            with ai2:
+                ai_roi_bar = alt.Chart(ai_summary).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X('AI_Category:N', title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('ROI:Q', title='ROI (%)'),
+                    color=alt.Color('AI_Category:N', scale=alt.Scale(
+                        domain=['AI-Flagged (Score\u226570)', 'Traditional (Score<70)'],
+                        range=['#6366f1', '#94a3b8']
+                    ), legend=None),
+                    tooltip=['AI_Category', alt.Tooltip('ROI:Q', format='.1f'), alt.Tooltip('Avg_Days:Q', format='.1f', title='Avg Days')]
+                ).properties(height=280, title='ROI Comparison: AI-Flagged vs Traditional')
+                st.altair_chart(ai_roi_bar, use_container_width=True)
+
+            # AI lift metrics
+            if len(ai_summary) == 2:
+                ai_flagged = ai_summary[ai_summary['AI_Category'].str.contains('AI-Flagged')].iloc[0]
+                traditional = ai_summary[~ai_summary['AI_Category'].str.contains('AI-Flagged')].iloc[0]
+                lift_confirm = ai_flagged['Confirm_Rate'] - traditional['Confirm_Rate']
+                lift_roi = ai_flagged['ROI'] - traditional['ROI']
+                speed_gain = traditional['Avg_Days'] - ai_flagged['Avg_Days']
+
+                lm1, lm2, lm3, lm4 = st.columns(4, gap="small")
+                lm1.metric("Confirmation Lift", f"+{lift_confirm:.1f}pp", help="AI-flagged confirmation rate advantage")
+                lm2.metric("ROI Lift", f"+{lift_roi:.1f}%", help="AI-flagged ROI advantage")
+                lm3.metric("Speed Gain", f"{speed_gain:.1f} days faster", help="Days saved per investigation")
+                lm4.metric("AI Case Share", f"{ai_flagged['Cases'] / ai_summary['Cases'].sum() * 100:.0f}%")
+
+                if lift_confirm > 10:
+                    st.success(f"\u2705 **AI Scoring delivers +{lift_confirm:.1f}pp higher confirmation rate** with {speed_gain:.0f} days faster resolution. "
+                             f"Consider lowering the AI-flag threshold to capture more high-value cases.")
+
+        except Exception as e:
+            st.warning(f"AI lift analysis unavailable: {e}")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 3: COST EFFICIENCY
+        # ============================================================
+        st.subheader("\U0001F4CA Cost Efficiency")
+
+        try:
+            # Cost efficiency by investigation status
+            status_roi = df.groupby('INVESTIGATION_STATUS').agg(
+                Cases=('INVESTIGATION_ID', 'count'),
+                Avg_Cost=('INVESTIGATION_COST', 'mean'),
+                Avg_Recovery=('RECOVERY_AMOUNT', 'mean'),
+                Avg_Days=('INVESTIGATION_DAYS', 'mean'),
+                Total_Cost=('INVESTIGATION_COST', 'sum'),
+                Total_Recovery=('RECOVERY_AMOUNT', 'sum')
+            ).reset_index()
+            status_roi['Efficiency'] = ((status_roi['Avg_Recovery'] - status_roi['Avg_Cost']) / status_roi['Avg_Cost'] * 100).round(1)
+
+            ce1, ce2 = st.columns(2)
+            with ce1:
+                eff_chart = alt.Chart(status_roi).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X('INVESTIGATION_STATUS:N', title=None, axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y('Efficiency:Q', title='Cost Efficiency (%)'),
+                    color=alt.Color('Efficiency:Q', scale=alt.Scale(scheme='redyellowgreen'), legend=None),
+                    tooltip=['INVESTIGATION_STATUS', alt.Tooltip('Efficiency:Q', format='.1f'),
+                            alt.Tooltip('Avg_Cost:Q', format=',.0f', title='Avg Cost'),
+                            alt.Tooltip('Avg_Recovery:Q', format=',.0f', title='Avg Recovery')]
+                ).properties(height=280, title='Cost Efficiency by Investigation Status')
+                st.altair_chart(eff_chart, use_container_width=True)
+
+            with ce2:
+                # Cost per confirmed fraud scatter
+                inv_cost = df[df['FINDINGS'] == 'FRAUD_CONFIRMED'].copy()
+                if not inv_cost.empty:
+                    scatter = alt.Chart(inv_cost).mark_circle(size=60, opacity=0.6).encode(
+                        x=alt.X('INVESTIGATION_COST:Q', title='Investigation Cost (AED)', scale=alt.Scale(zero=False)),
+                        y=alt.Y('RECOVERY_AMOUNT:Q', title='Recovery Amount (AED)', scale=alt.Scale(zero=False)),
+                        color=alt.Color('FRAUD_SCORE:Q', scale=alt.Scale(scheme='plasma'), title='Fraud Score'),
+                        size=alt.Size('FRAUD_AMOUNT_DETECTED:Q', legend=None),
+                        tooltip=['INVESTIGATION_ID', alt.Tooltip('INVESTIGATION_COST:Q', format=',.0f'),
+                                alt.Tooltip('RECOVERY_AMOUNT:Q', format=',.0f'),
+                                alt.Tooltip('FRAUD_SCORE:Q', format='.0f')]
+                    ).properties(height=280, title='Cost vs Recovery (Confirmed Fraud Only)')
+                    # Break-even line
+                    max_val = max(inv_cost['INVESTIGATION_COST'].max(), inv_cost['RECOVERY_AMOUNT'].max())
+                    be_line = alt.Chart(pd.DataFrame({'x': [0, max_val], 'y': [0, max_val]})).mark_line(
+                        strokeDash=[5,3], color='gray', opacity=0.5
+                    ).encode(x='x:Q', y='y:Q')
+                    st.altair_chart((scatter + be_line), use_container_width=True)
+                else:
+                    st.info("No confirmed fraud cases for scatter analysis.")
+
+            # Cost efficiency summary table
+            with st.expander("Detailed Cost Breakdown by Status", expanded=False):
+                display_roi = status_roi.copy()
+                display_roi.columns = ['Status', 'Cases', 'Avg Cost', 'Avg Recovery', 'Avg Days', 'Total Cost', 'Total Recovery', 'Efficiency %']
+                st.dataframe(display_roi, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.warning(f"Cost efficiency analysis unavailable: {e}")
+
+        st.markdown("---")
+
+        # ============================================================
+        # SECTION 4: FORWARD-LOOKING PROJECTIONS
+        # ============================================================
+        st.subheader("\U0001F52E Forward-Looking Projections")
+
+        try:
+            if 'roi_monthly' in dir() and not roi_monthly.empty and len(roi_monthly) >= 3:
+                # Simple linear projection based on recent trends
+                recent_months = roi_monthly.tail(6)
+                avg_monthly_recovery = recent_months['total_recovery'].mean()
+                avg_monthly_cost = recent_months['total_cost'].mean()
+                avg_monthly_cases = recent_months['cases'].mean()
+                recovery_growth = recent_months['total_recovery'].pct_change().mean()
+
+                fp1, fp2, fp3, fp4 = st.columns(4, gap="small")
+                fp1.metric("Avg Monthly Recovery", f"AED {avg_monthly_recovery:,.0f}")
+                fp2.metric("Avg Monthly Cost", f"AED {avg_monthly_cost:,.0f}")
+                fp3.metric("Monthly Net Benefit", f"AED {avg_monthly_recovery - avg_monthly_cost:,.0f}")
+                fp4.metric("Recovery Growth Rate", f"{recovery_growth * 100:+.1f}%/mo")
+
+                # 6-month projection
+                projection_months = 6
+                proj_data = []
+                last_recovery = recent_months.iloc[-1]['total_recovery']
+                last_cost = recent_months.iloc[-1]['total_cost']
+                cum_rec = roi_monthly['total_recovery'].sum()
+                cum_cost = roi_monthly['total_cost'].sum()
+
+                for i in range(1, projection_months + 1):
+                    proj_recovery = last_recovery * (1 + recovery_growth) ** i
+                    proj_cost = last_cost * 1.02 ** i  # 2% cost inflation assumption
+                    cum_rec += proj_recovery
+                    cum_cost += proj_cost
+                    proj_data.append({
+                        'Month': f'+{i}',
+                        'Projected_Recovery': proj_recovery,
+                        'Projected_Cost': proj_cost,
+                        'Projected_Net': proj_recovery - proj_cost,
+                        'Projected_Cum_ROI': ((cum_rec - cum_cost) / cum_cost * 100)
+                    })
+
+                proj_df = pd.DataFrame(proj_data)
+
+                pj1, pj2 = st.columns(2)
+                with pj1:
+                    proj_chart = alt.Chart(proj_df).mark_bar(cornerRadiusEnd=3).encode(
+                        x=alt.X('Month:N', title='Months Ahead'),
+                        y=alt.Y('Projected_Net:Q', title='Projected Net Benefit (AED)'),
+                        color=alt.value('#10b981'),
+                        tooltip=['Month', alt.Tooltip('Projected_Recovery:Q', format=',.0f', title='Recovery'),
+                                alt.Tooltip('Projected_Cost:Q', format=',.0f', title='Cost'),
+                                alt.Tooltip('Projected_Net:Q', format=',.0f', title='Net')]
+                    ).properties(height=250, title='6-Month Net Benefit Projection')
+                    st.altair_chart(proj_chart, use_container_width=True)
+
+                with pj2:
+                    proj_roi_chart = alt.Chart(proj_df).mark_line(strokeWidth=2.5, point=True, color='#6366f1').encode(
+                        x=alt.X('Month:N', title='Months Ahead'),
+                        y=alt.Y('Projected_Cum_ROI:Q', title='Projected Cumulative ROI (%)'),
+                        tooltip=['Month', alt.Tooltip('Projected_Cum_ROI:Q', format='.1f', title='Cum ROI %')]
+                    ).properties(height=250, title='Projected Cumulative ROI Trajectory')
+                    st.altair_chart(proj_roi_chart, use_container_width=True)
+
+                st.caption("\u26A0\uFE0F Projections based on recent 6-month trends with 2% cost inflation assumption. Actual results may vary.")
+
+                with st.expander("Projection Details", expanded=False):
+                    proj_display = proj_df.copy()
+                    proj_display['Projected_Recovery'] = proj_display['Projected_Recovery'].apply(lambda x: f"AED {x:,.0f}")
+                    proj_display['Projected_Cost'] = proj_display['Projected_Cost'].apply(lambda x: f"AED {x:,.0f}")
+                    proj_display['Projected_Net'] = proj_display['Projected_Net'].apply(lambda x: f"AED {x:,.0f}")
+                    proj_display['Projected_Cum_ROI'] = proj_display['Projected_Cum_ROI'].apply(lambda x: f"{x:.1f}%")
+                    proj_display.columns = ['Month', 'Recovery', 'Cost', 'Net Benefit', 'Cumulative ROI']
+                    st.dataframe(proj_display, use_container_width=True, hide_index=True)
+            else:
+                st.info("Insufficient monthly data for forward projections (minimum 3 months required).")
+
+        except Exception as e:
+            st.warning(f"Forward projections unavailable: {e}")
 
 # --- PAGE: GenAI Insights ---
 elif page == "\U0001F916  GenAI Insights":
@@ -1223,13 +2504,12 @@ elif page == "\U0001F916  GenAI Insights":
         col1, = st.columns(1, gap="large")
         with col1:
             st.markdown("""<div class="glass-card">
-            <h4 style="margin-top:0">\U0001F4A1 Genie Space: Insurance Operations</h4>
+            <h4 style="margin-top:0">\U0001F4A1 Genie Space: Fraud Investigation</h4>
 
-The **Insurance Operations and Analytics** Genie Space is live and connected to **19 tables** including fraud investigations, claims, customers, policies, financials, and AI results.
-
+This Genie space enables natural language analytics for insurance fraud detection and investigation. It covers key business domains including fraud investigations, claims, payments, premiums, policies, financials, investments, litigation, and sales performance.
 Business users can ask natural language questions directly in the Genie room.
             </div>""", unsafe_allow_html=True)
-            genie_url = f"https://{DATABRICKS_HOST}/genie/rooms/01f13ca173fa16e99feabaf195b2830a" if DATABRICKS_HOST else "#"
+            genie_url = f"https://{DATABRICKS_HOST}/genie/rooms/01f1711e8b581b708c3337d6bb25144b" if DATABRICKS_HOST else "#"
             st.link_button("\U0001F680 Open Genie Space", genie_url)
 
 #         with col2:
@@ -1253,7 +2533,7 @@ Business users can ask natural language questions directly in the Genie room.
         </div>""", unsafe_allow_html=True)
         st.markdown("Query the Genie Space directly from this app. Genie uses your approved tables and business definitions.")
 
-        GENIE_SPACE_ID = "01f13ca173fa16e99feabaf195b2830a"
+        GENIE_SPACE_ID = "01f1711e8b581b708c3337d6bb25144b"
 
         if "genie_history" not in st.session_state:
             st.session_state.genie_history = []
@@ -1364,17 +2644,123 @@ Business users can ask natural language questions directly in the Genie room.
             st.markdown("""<div class="glass-card" style="text-align: center; padding: 30px;">
                 <div style="font-size: 2rem; margin-bottom: 8px;">\U0001F9DE</div>
                 <div style="color: #cbd5e1; font-size: 0.95rem;">Ask Genie a question to query your insurance data using natural language</div>
-                <div style="color: #94a3b8; font-size: 0.82rem; margin-top: 6px;">Connected to 19 tables in salama_insurance.salama_silver</div>
+                <div style="color: #94a3b8; font-size: 0.82rem; margin-top: 6px;">Connected to 19 tables in uae_insurance.uae_silver</div>
             </div>""", unsafe_allow_html=True)
 
     with ai_tab2:
-        st.markdown("**Databricks AI Query** - Generate executive summaries")
-        summary_scope = st.selectbox("Summary Scope", ["Overall Portfolio"])
-        if st.button("Generate AI Summary", key="summary_btn"):
+        st.markdown("""<div class="section-header">
+            <span class="section-header-icon">\U0001F4CA</span>
+            <span class="section-header-text">CXO Executive Intelligence Brief</span>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("AI-generated strategic summary for C-suite stakeholders. Synthesizes portfolio health, financial exposure, operational efficiency, and forward-looking risk posture.")
+
+        sum_col1, sum_col2 = st.columns([1.5, 3.5])
+        with sum_col1:
+            summary_scope = st.selectbox("Summary Scope", ["Overall Portfolio", "High-Risk Cases Only", "Financial Recovery Focus", "Operational Efficiency"], key="exec_scope")
+            summary_tone = st.selectbox("Audience", ["CEO / Board", "CFO / Finance", "COO / Operations", "CRO / Risk"], key="exec_tone")
+
+        if st.button("\U0001F4CB Generate Executive Brief", key="summary_btn", use_container_width=False):
             if not df.empty:
-                with st.spinner("Generating summary via Databricks Foundation Models..."):
-                    ctx = f"Investigations: {len(df)}, Avg Score: {df['FRAUD_SCORE'].mean():.1f}, Det: AED {df['FRAUD_AMOUNT_DETECTED'].sum():,.0f}, Rec: AED {df['RECOVERY_AMOUNT'].sum():,.0f}"
-                    prompt_text = escape_sql(f"You are a senior fraud analyst. Write an executive markdown summary based on this: {ctx}. Keep it concise.")
+                with st.spinner("Compiling executive intelligence from fraud portfolio data..."):
+                    # Build comprehensive CXO context
+                    total_inv = len(df)
+                    avg_score = df['FRAUD_SCORE'].mean()
+                    total_detected = df['FRAUD_AMOUNT_DETECTED'].sum()
+                    total_recovered = df['RECOVERY_AMOUNT'].sum()
+                    total_cost = df['INVESTIGATION_COST'].sum()
+                    recovery_rate = (total_recovered / total_detected * 100) if total_detected > 0 else 0
+                    roi = ((total_recovered - total_cost) / total_cost * 100) if total_cost > 0 else 0
+                    avg_days = df['INVESTIGATION_DAYS'].mean()
+
+                    # Status breakdown
+                    status_counts = df['INVESTIGATION_STATUS'].value_counts().to_dict()
+                    active_cases = status_counts.get('INITIATED', 0) + status_counts.get('IN_PROGRESS', 0)
+                    closed_cases = status_counts.get('COMPLETED', 0) + status_counts.get('CLOSED', 0)
+                    closure_rate = (closed_cases / total_inv * 100) if total_inv > 0 else 0
+
+                    # Findings breakdown
+                    findings_counts = df['FINDINGS'].value_counts().to_dict()
+                    confirmed_fraud = findings_counts.get('FRAUD_CONFIRMED', 0)
+                    no_fraud = findings_counts.get('NO_FRAUD', 0)
+                    false_positive_rate = (no_fraud / total_inv * 100) if total_inv > 0 else 0
+                    confirmation_rate = (confirmed_fraud / total_inv * 100) if total_inv > 0 else 0
+
+                    # High risk segment
+                    high_risk = df[df['FRAUD_SCORE'] > 75]
+                    high_risk_pct = (len(high_risk) / total_inv * 100) if total_inv > 0 else 0
+                    high_risk_exposure = high_risk['FRAUD_AMOUNT_DETECTED'].sum()
+
+                    # SLA breaches (>30 days active)
+                    active_df = df[df['INVESTIGATION_STATUS'].isin(['INITIATED', 'IN_PROGRESS'])]
+                    sla_breached = len(active_df[active_df['INVESTIGATION_DAYS'] > 30])
+                    sla_breach_pct = (sla_breached / len(active_df) * 100) if len(active_df) > 0 else 0
+
+                    # MoM trend (last 2 months)
+                    df['MONTHYEAR_SORT'] = pd.to_numeric(df['MONTHYEAR_SORT'], errors='coerce')
+                    monthly_trend = df.groupby('MONTHYEAR_SORT').agg(
+                        cases=('INVESTIGATION_ID', 'count'),
+                        fraud=('FRAUD_AMOUNT_DETECTED', 'sum')
+                    ).sort_index()
+                    mom_case_change = 0
+                    mom_fraud_change = 0
+                    if len(monthly_trend) >= 2:
+                        prev, latest = monthly_trend.iloc[-2], monthly_trend.iloc[-1]
+                        mom_case_change = ((latest['cases'] - prev['cases']) / prev['cases'] * 100) if prev['cases'] > 0 else 0
+                        mom_fraud_change = ((latest['fraud'] - prev['fraud']) / prev['fraud'] * 100) if prev['fraud'] > 0 else 0
+
+                    # Scope-specific filter
+                    scope_context = ""
+                    if summary_scope == "High-Risk Cases Only":
+                        scope_context = f"Focus ONLY on high-risk cases (score>75): {len(high_risk)} cases, AED {high_risk_exposure:,.0f} exposure, {high_risk_pct:.1f}% of portfolio."
+                    elif summary_scope == "Financial Recovery Focus":
+                        scope_context = f"Focus on FINANCIAL RECOVERY: AED {total_recovered:,.0f} recovered of AED {total_detected:,.0f} detected. Recovery rate: {recovery_rate:.1f}%. Net ROI: {roi:.1f}%. Cost basis: AED {total_cost:,.0f}."
+                    elif summary_scope == "Operational Efficiency":
+                        scope_context = f"Focus on OPERATIONAL EFFICIENCY: Avg resolution: {avg_days:.0f} days. Closure rate: {closure_rate:.1f}%. Active pipeline: {active_cases} cases. SLA breach rate: {sla_breach_pct:.1f}%."
+                    else:
+                        scope_context = "Provide a comprehensive overview across all dimensions."
+
+                    # Audience tone
+                    tone_instructions = {
+                        "CEO / Board": "Write for a CEO and Board audience. Lead with strategic risk posture, business impact in AED, and actionable recommendations. Use decisive language. Include a 1-line verdict at the top.",
+                        "CFO / Finance": "Write for a CFO. Emphasize financial metrics: ROI, recovery rates, cost-per-case, reserve adequacy, and P&L impact. Include variance analysis where relevant.",
+                        "COO / Operations": "Write for a COO. Emphasize throughput, SLA compliance, resource utilization, bottlenecks, and process improvement opportunities.",
+                        "CRO / Risk": "Write for a Chief Risk Officer. Emphasize risk exposure, emerging threats, model accuracy (false positive rate), portfolio concentration, and regulatory compliance posture."
+                    }[summary_tone]
+
+                    ctx = f"""FRAUD INVESTIGATION PORTFOLIO DATA:
+- Total Investigations: {total_inv:,}
+- Active Pipeline: {active_cases:,} | Closed: {closed_cases:,} | Closure Rate: {closure_rate:.1f}%
+- Avg Fraud Score: {avg_score:.1f}/100
+- Total Fraud Detected: AED {total_detected:,.0f}
+- Total Recovered: AED {total_recovered:,.0f} | Recovery Rate: {recovery_rate:.1f}%
+- Total Investigation Cost: AED {total_cost:,.0f} | Net ROI: {roi:.1f}%
+- Avg Investigation Duration: {avg_days:.0f} days
+- Fraud Confirmed: {confirmed_fraud} ({confirmation_rate:.1f}%) | No Fraud: {no_fraud} ({false_positive_rate:.1f}%)
+- High-Risk Cases (score>75): {len(high_risk)} ({high_risk_pct:.1f}%) | Exposure: AED {high_risk_exposure:,.0f}
+- SLA Breaches (>30d active): {sla_breached} ({sla_breach_pct:.1f}% of active)
+- MoM Case Volume Change: {mom_case_change:+.1f}%
+- MoM Fraud Amount Change: {mom_fraud_change:+.1f}%
+- Findings: FRAUD_CONFIRMED={confirmed_fraud}, FRAUD_SUSPECTED={findings_counts.get('FRAUD_SUSPECTED', 0)}, INCONCLUSIVE={findings_counts.get('INCONCLUSIVE', 0)}, NO_FRAUD={no_fraud}
+
+SCOPE: {scope_context}"""
+
+                    prompt_text = escape_sql(f"""You are the Chief Analytics Officer at a Middle East insurance company presenting to the executive committee.
+
+{tone_instructions}
+
+Structure your response in markdown with these sections:
+## Executive Verdict (1-2 sentences — the headline)
+## Key Metrics Dashboard (use a clean bullet list with AED values)
+## Risk & Exposure Assessment (what keeps you up at night)
+## Operational Performance (efficiency, bottlenecks, SLA)
+## Strategic Recommendations (3-5 actionable items, prioritized)
+## 90-Day Outlook (forward-looking projection based on MoM trends)
+
+Be specific with numbers. Use AED currency. Flag any metric that is in a danger zone. If ROI is strong, say so confidently. If there are concerns, be direct.
+
+DATA:
+{ctx}""")
+
                     try:
                         query = f"SELECT ai_query('databricks-claude-sonnet-4-6', '{prompt_text}') AS AI_SUMMARY"
                         result = execute_sql(query)
@@ -1593,7 +2979,7 @@ Business users can ask natural language questions directly in the Genie room.
                             ', Recovered: AED ' || cast(round(fi.RECOVERY_AMOUNT, 0) as STRING) ||
                             ' after ' || cast(fi.INVESTIGATION_DAYS as STRING) || ' days.'
                         ) AS SENTIMENT
-                    FROM salama_insurance.salama_silver.fact_fraud_investigation fi
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
                     ORDER BY fi.FRAUD_SCORE DESC LIMIT {sent_limit}
                     """
                     mode_label = "AI-Enhanced (ai_analyze_sentiment)"
@@ -1613,7 +2999,7 @@ Business users can ask natural language questions directly in the Genie room.
                             WHEN INVESTIGATION_STATUS IN ('Open', 'Under Review') THEN 'neutral'
                             ELSE 'neutral'
                         END AS SENTIMENT
-                    FROM salama_insurance.salama_silver.fact_fraud_investigation
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation
                     ORDER BY FRAUD_SCORE DESC LIMIT {sent_limit}
                     """
                     mode_label = "Rule-Based (instant)"
@@ -1685,8 +3071,8 @@ Business users can ask natural language questions directly in the Genie room.
                             }}',
                             MAP('instructions', 'Classify this fraud investigation into a combined severity-likelihood-impact tier.')
                         ):response[0] AS RISK_COMPOSITE
-                    FROM salama_insurance.salama_silver.fact_fraud_investigation fi
-                    ORDER BY fi.FRAUD_SCORE DESC LIMIT {risk_limit}
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation fi
+                    ORDER BY RANDOM() LIMIT {risk_limit}
                     """
                     try:
                         risk_result = execute_sql(risk_query)
@@ -1733,7 +3119,7 @@ Business users can ask natural language questions directly in the Genie room.
                             WHEN FRAUD_AMOUNT_DETECTED > 10000 THEN 'Moderate'
                             ELSE 'Minor'
                         END AS IMPACT
-                    FROM salama_insurance.salama_silver.fact_fraud_investigation
+                    FROM uae_insurance.uae_silver.fact_fraud_investigation
                     ORDER BY FRAUD_SCORE DESC
                     LIMIT {risk_limit}
                     """
@@ -1796,7 +3182,7 @@ Business users can ask natural language questions directly in the Genie room.
                 SELECT
                     DATE_TRUNC('month', FR_DATE) AS month_date,
                     {sql_expr} AS metric_value
-                FROM salama_insurance.salama_silver.fact_fraud_investigation
+                FROM uae_insurance.uae_silver.fact_fraud_investigation
                 GROUP BY 1
                 ORDER BY 1
                 """
@@ -2009,7 +3395,7 @@ if page == "\U0001F9D1\U0000200D\U0001F4BC  AI Supervisor":
     </div>""", unsafe_allow_html=True)
     st.markdown("""This **multi-agent supervisor** orchestrates your Genie Space (structured data) and Claims Document Search (unstructured PDFs) to answer complex questions that span both data sources. Powered by **Databricks Agent Bricks**.""")
 
-    SUPERVISOR_ENDPOINT = "mas-d55c51ee-endpoint"
+    SUPERVISOR_ENDPOINT = "mas-5c4a9766-endpoint"
 
     if "supervisor_history" not in st.session_state:
         st.session_state.supervisor_history = []
@@ -2126,7 +3512,7 @@ The Supervisor Agent receives your question and intelligently routes it to the r
 
 | Subagent | Type | Handles |
 |----------|------|---------|
-| **Insurance Operations** | Genie Space | Structured queries — fraud scores, claim amounts, investigator stats, trends across 19 tables |
+| **Fraud Investigation** | Genie Space | Structured queries — fraud scores, claim amounts, investigator stats, trends across 19 tables |
 | **Claims Document Search** | UC Function | Unstructured search — claim forms, settlement letters, investigation reports, denial letters (25 PDFs) |
 
 **Routing logic:**
@@ -2134,7 +3520,7 @@ The Supervisor Agent receives your question and intelligently routes it to the r
 - Questions about **document contents, reasons, findings** → Claims Document Search
 - Questions needing **both** → Calls both and synthesizes the results
 
-**Endpoint:** `mas-d55c51ee-endpoint` | **Built with:** Databricks Agent Bricks
+**Endpoint:** `mas-5c4a9766-endpoint` | **Built with:** Databricks Agent Bricks
         """)
 
 
@@ -2180,7 +3566,7 @@ if page == "\U0001F4CA  Observability":
                       AND u.usage_metadata.endpoint_name IN (
                           'claims_rag_agent', 'databricks-claude-sonnet-4-5', 'databricks-bge-large-en',
                           'databricks-meta-llama-3-3-70b-instruct', 'databricks-ai-analyze-sentiment',
-                          'mas-d55c51ee-endpoint'
+                          'mas-5c4a9766-endpoint'
                       )
                       AND u.usage_date >= current_date() - INTERVAL {obs_days} DAYS
                 ),
@@ -2205,7 +3591,7 @@ if page == "\U0001F4CA  Observability":
                 grand_total = cost_by_endpoint['total_cost_usd'].sum()
 
                 llm_cost = cost_by_endpoint[cost_by_endpoint['endpoint_name'].isin(['databricks-claude-sonnet-4-5', 'databricks-meta-llama-3-3-70b-instruct'])]['total_cost_usd'].sum()
-                agent_cost = cost_by_endpoint[cost_by_endpoint['endpoint_name'].isin(['claims_rag_agent', 'mas-d55c51ee-endpoint'])]['total_cost_usd'].sum()
+                agent_cost = cost_by_endpoint[cost_by_endpoint['endpoint_name'].isin(['claims_rag_agent', 'mas-5c4a9766-endpoint'])]['total_cost_usd'].sum()
                 embed_cost = cost_by_endpoint[cost_by_endpoint['endpoint_name'].isin(['databricks-bge-large-en'])]['total_cost_usd'].sum()
 
                 kc1, kc2, kc3, kc4 = st.columns(4, gap="medium")
@@ -2255,7 +3641,7 @@ if page == "\U0001F4CA  Observability":
                           AND u.usage_metadata.endpoint_name IN (
                               'claims_rag_agent', 'databricks-claude-sonnet-4-5', 'databricks-bge-large-en',
                               'databricks-meta-llama-3-3-70b-instruct', 'databricks-ai-analyze-sentiment',
-                              'mas-d55c51ee-endpoint'
+                              'mas-5c4a9766-endpoint'
                           )
                           AND u.usage_date >= current_date() - INTERVAL {obs_days} DAYS
                     ),
@@ -2300,7 +3686,7 @@ if page == "\U0001F4CA  Observability":
                     ROUND(PERCENTILE(execution_duration_ms, 0.95) / 1000.0, 1) AS p95_latency_sec,
                     SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) AS success_count,
                     ROUND(SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS success_rate
-                FROM salama_insurance.salama_silver.claims_rag_agent_payload
+                FROM uae_insurance.uae_silver.claims_rag_agent_payload
                 WHERE request_time >= current_timestamp() - INTERVAL {obs_interval}
             """)
             if not rag_metrics.empty and rag_metrics['total_requests'].iloc[0] > 0:
@@ -2329,7 +3715,7 @@ if page == "\U0001F4CA  Observability":
                         COUNT(*) AS requests,
                         ROUND(AVG(execution_duration_ms) / 1000.0, 1) AS avg_latency_sec,
                         ROUND(PERCENTILE(execution_duration_ms, 0.95) / 1000.0, 1) AS p95_latency_sec
-                    FROM salama_insurance.salama_silver.claims_rag_agent_payload
+                    FROM uae_insurance.uae_silver.claims_rag_agent_payload
                     WHERE request_time >= current_timestamp() - INTERVAL {obs_interval}
                     GROUP BY 1
                     ORDER BY 1
@@ -2361,7 +3747,7 @@ if page == "\U0001F4CA  Observability":
                     SUM(COALESCE(eu.input_token_count, 0) + COALESCE(eu.output_token_count, 0)) AS total_tokens
                 FROM system.serving.endpoint_usage eu
                 JOIN system.serving.served_entities se ON eu.served_entity_id = se.served_entity_id
-                WHERE se.endpoint_name IN ('claims_rag_agent', 'mas-d55c51ee-endpoint',
+                WHERE se.endpoint_name IN ('claims_rag_agent', 'mas-5c4a9766-endpoint',
                                             'databricks-claude-sonnet-4-5', 'databricks-bge-large-en',
                                             'databricks-meta-llama-3-3-70b-instruct', 'databricks-ai-analyze-sentiment')
                   AND eu.request_time >= current_timestamp() - INTERVAL {obs_interval}
@@ -2415,7 +3801,7 @@ if page == "\U0001F4CA  Observability":
             ai_query_perf = execute_sql(f"""
                 SELECT
                     CASE
-                        WHEN statement_text LIKE '%mas-d55c51ee-endpoint%' THEN 'Supervisor Agent'
+                        WHEN statement_text LIKE '%mas-5c4a9766-endpoint%' THEN 'Supervisor Agent'
                         WHEN statement_text LIKE '%claims_rag_agent%' THEN 'Claims RAG Agent'
                         WHEN statement_text LIKE '%databricks-meta-llama%' THEN 'Llama (FinOps)'
                         WHEN statement_text LIKE '%analyze-sentiment%' THEN 'Sentiment Analysis'
@@ -2449,7 +3835,7 @@ if page == "\U0001F4CA  Observability":
                     SELECT
                         DATE_TRUNC('hour', start_time) AS time_bucket,
                         CASE
-                            WHEN statement_text LIKE '%mas-d55c51ee-endpoint%' THEN 'Supervisor'
+                            WHEN statement_text LIKE '%mas-5c4a9766-endpoint%' THEN 'Supervisor'
                             WHEN statement_text LIKE '%claims_rag_agent%' THEN 'Claims RAG'
                             ELSE 'Other'
                         END AS agent,
@@ -2490,7 +3876,7 @@ if page == "\U0001F4CA  Observability":
                         CAST(status_code AS STRING) AS status,
                         CAST(execution_duration_ms AS STRING) || 'ms' AS duration,
                         LEFT(request, 200) AS detail
-                    FROM salama_insurance.salama_silver.claims_rag_agent_payload
+                    FROM uae_insurance.uae_silver.claims_rag_agent_payload
                     WHERE status_code != 200
                       AND request_time >= current_timestamp() - INTERVAL {obs_interval}
                 )

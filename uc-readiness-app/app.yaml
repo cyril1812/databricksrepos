@@ -3,5 +3,5 @@ command: ["streamlit", "run", "app.py"]
 
 env:
   - name: DATABRICKS_WAREHOUSE_ID
-    value: 6fcaa843626846e7
+    value: c10f6d361983c074 
     description: SQL Warehouse ID for querying assessment data
